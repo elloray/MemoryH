@@ -1,19 +1,108 @@
 # MemoryH
 
-MemoryH 是面向 LLM 的记忆检索原型和评测工具。它比较 **SQLite FTS5**、**FTS5 + 扁平向量**和 **FTS5 + 语义二叉树**，提供中文合成用例、LoCoMo 中文评测和官方 LongMemEval-S 英文评测的复现脚本与逐题结果。
+MemoryH 是面向 LLM 的嵌入式记忆存储与检索引擎。Rust 核心提供版本化持久存储、内存缓存、BM25 关键词召回、向量召回和混合排序。仓库另保留 SQLite FTS5 对照路线。
 
 在 LongMemEval-S 的 500 题上，FTS5 + 扁平向量的端到端准确率为 **84.2%**，同配置官方 BM25 为 **73.2%**，语义二叉树 Beam 3 为 **76.6%**。三条路线均将 Top 5 完整会话交给同一个 GPT-4o 快照作答并判分。[LongMemEval-S 评测报告](longmemeval-results.md)
 
 中文合成用例对照整题检索与子问题独立检索，覆盖字面命中、同义改写、跨分支取证和记忆更正。[中文样本与证据标注](cases.json) · [逐题报告](results.md)
 
-## 运行
+## Rust 存储引擎
 
-安装 `uv`，在本目录运行。脚本需要带 FTS5 的 Python 3.12 或 3.13。首次运行会下载依赖和中文嵌入模型，模型推理在本机执行。
+- **内存层**按记录 ID 缓存热原文，用字节预算约束 LRU。冷读按内存索引里的段号和偏移从磁盘取原文，再回填内存。可通过 `cache_stats()` 查看命中、磁盘读取和淘汰次数。
+- **块缓存**可通过 `Store::open_with_block_cache` 从同一 RAM 预算划出一部分。原文 LRU 未命中时，小记录可复用同一段文件的 4 KiB 对齐块，解码后进入原文 LRU。超过 4 KiB 的编码记录走原有精确读取路径。
+- **磁盘层**使用 MemoryH 自定义的二进制追加日志。每批操作共用一个修订号，通过长度与 CRC 校验，落盘后才对读操作可见。达到目标段大小后追加到新文件，旧段保留历史版本。
+- **记忆版本**由逻辑键和不可复用的记录 ID 标识。更正和撤回要求传入当前记录 ID。用 `get_at` 读取某个修订号的可见版本，用 `get_by_id` 读取保留的历史原文。
+
+多线程写入可用 `Store::open(path, options)?.into_shared()`，将返回的 `SharedStore` 克隆给各线程。`BgeStore` 已支持直接克隆，多个句柄共用编码器和提交队列。每次成功的非空 `apply` 拿到独立修订号，成功返回时该请求已完成磁盘同步，后续读取可见。引擎按入队顺序处理已到达的请求，每组最多 64 个请求、目标 1 MiB，单个大请求独立提交。段文件切换前同步旧段。单写者立即提交，多写者可共享一次同步。可用 `data_syncs()` 读取本次打开库后成功的数据同步次数。[组提交复测](group-commit-results.md)
+
+安装 Rust 1.89 或更高版本，运行 `cargo test --locked`。以下示例展示基本嵌入方式，存储目录的父目录需要已存在。
+
+```rust
+use memoryh::{Memory, Mutation, Options, Query, SearchMethod, SearchOptions, Store};
+
+fn main() -> memoryh::Result<()> {
+    let mut store = Store::open("memoryh-data", Options::default())?;
+    store.apply(&[Mutation::Put(Memory {
+        id: "coffee-v1".into(),
+        key: "preferences.coffee".into(),
+        source: "2026-11-25 conversation".into(),
+        body: "拿铁用无糖豆奶".into(),
+    })])?;
+    let query = Query { text: "无糖豆奶", embedding: None };
+    let coffee = store.retrieve(&[query], &SearchOptions::default(), SearchMethod::Keywords)?;
+    println!("{coffee:?}");
+    Ok(())
+}
+```
+
+同一存储目录使用一个独占句柄。本版启动时重放段文件重建内存索引，恢复会截去最后一段中未写完整的事务，并将完整事务校验失败报告为损坏。内存缓存默认 16 MiB，磁盘段目标大小默认 64 MiB，单批编码大小上限 64 MiB。当前测试运行在 macOS。
+
+`Store::apply_with_embeddings` 将记录向量随原文写入同一事务。引擎从日志恢复当前版本的倒排索引和向量，语义树在查询时构建。更正或撤回会更新当前检索候选，旧原文仍可用 `get_by_id` 读取。旧格式段文件可直接打开并构建关键词索引。
+
+`Store` 也接受调用方生成的向量，同一个库使用同一模型的记录与问题向量。`query_variants` 可拆分问题，`Store::search` 接收整题和子问题及其向量，返回关键词、扁平向量、树向量和融合排名。`Store::retrieve` 可直接返回指定路线的 Top K 原文。倒排索引和活跃向量常驻内存，单独计入引擎内存开销。
+
+### Rust 原生中文 BGE
+
+启用 Cargo 的 `bge` 功能后，`BgeStore` 在 Rust 进程中加载中文 BGE。它用 ONNX Runtime 的 CPU 后端推理，使用 512 token 截断、CLS 池化、L2 归一化和原有的中文查询前缀。`apply` 接受原文写入与更正，`retrieve` 接受问题文本并返回最多三条带来源的原文，默认走 BM25 + 扁平向量和子问题向量首位保留。 [评测用的模型快照](https://huggingface.co/Qdrant/bge-small-zh-v1.5/tree/46fbe35fd4374a00fee7de77dfddaeb6dd6a2c59)
+
+应用启动时传入包含 `model_optimized.onnx` 和 `tokenizer.json` 的目录，以及支持 API 24 或更高版本的 ONNX Runtime 动态库路径。模型实例可复用到后续请求中。
+
+在 Apple Silicon 上，`bash scripts/build-onnxruntime-cpu.sh` 会构建 ONNX Runtime 1.32.0 的 CPU 动态库，关闭 1DS 遥测、CoreML 和加速器探测，使用标准错误输出日志。构建需要 `uv` 和 Apple C++ 工具链。默认产物在 `target/ort-cpu/build/Release/libonnxruntime.1.32.0.dylib`。 [ONNX Runtime 1.32.0 源码存档](https://sourceforge.net/projects/onnx-runtime.mirror/files/v1.32.0/)
+
+```rust
+use memoryh::{Options, Result};
+use memoryh::bge::{BgeSmallZh, BgeStore};
+
+fn main() -> Result<()> {
+    let encoder = BgeSmallZh::load(
+        "bge-small-zh-v1.5",
+        "target/ort-cpu/build/Release/libonnxruntime.1.32.0.dylib",
+        2,
+    )?;
+    let store = BgeStore::open("memoryh-data", Options::default(), encoder)?;
+    let hits = store.retrieve("我点拿铁时用什么奶？")?;
+    println!("{hits:?}");
+    Ok(())
+}
+```
+
+同一批中文用例可用下列命令核对。Rust 示例直接生成结果。`uv` 命令额外运行 Python FastEmbed 基线，使用同一份模型目录并对比 Top 3、模型初始化和在线查询延迟。
 
 ```sh
-uv run --script benchmark.py
-uv run --script benchmark.py --top-k 5
+cargo build --locked --release --features bge --example bge_benchmark
+target/release/examples/bge_benchmark "$BGE_MODEL_DIR" "$ONNX_RUNTIME_LIB" 30
+uv run --with . --script bge_benchmark.py \
+  --model-dir "$BGE_MODEL_DIR" --runtime-library "$ONNX_RUNTIME_LIB" --rounds 30
 ```
+
+用同一个 Rust 可执行文件比较两套运行库时，传入 `--reference-runtime-library`。这条命令只用 Python 汇总报告，两个检索进程都运行原生 Rust 示例。
+
+```sh
+python3 bge_benchmark.py --model-dir "$BGE_MODEL_DIR" \
+  --reference-runtime-library "$REFERENCE_ONNX_RUNTIME_LIB" \
+  --runtime-library "$ONNX_RUNTIME_LIB" --rounds 100
+```
+
+## 运行检索对照
+
+三个检索脚本均支持 `--storage rust`。这条路线由 Python 运行本地 BGE 模型、调用 Rust 和评分，由 Rust 负责写入、分词、BM25、语义树、向量打分、RRF、子问题合并和原文读取。`--storage sqlite` 使用带 FTS5 的 Python，保留原先的对照流程。
+
+```sh
+uv run --with . --script benchmark.py --storage rust
+uv run --script benchmark.py --storage sqlite
+```
+
+### 存储延迟和缓存
+
+延迟测试回放合成用例中 FTS5 + 扁平向量路线返回的 Top 3 原文 ID。它保留更正前后的检索顺序并逐条核对原文，比较真实磁盘文件上的首次回放、引擎冷读和内存热读。[对照结果](storage-results.md)
+
+同一命令也对照了 Rust 原文 LRU 加 4 KiB 块缓存，记录整次读取命中、块命中与读块次数。[块缓存复测](storage-block-results.md)
+
+```sh
+uv run --with . --script storage_benchmark.py --rounds 60
+```
+
+macOS 上可加 `--uncached-io`，在同一文件系统上测两边启用 `F_NOCACHE` 的冷读。用 `--work-dir` 指定两个临时库共同使用的父目录。[macOS 文件缓存说明](https://developer.apple.com/library/archive/documentation/Performance/Conceptual/FileSystem/Articles/FilePerformance.html)
 
 ## LoCoMo 中文评测
 
@@ -73,4 +162,4 @@ uv run --script longmemeval_qa.py --official-dir "$LME_DIR" \
 - **更正** 在一个 SQLite 事务中保留旧原文、停用旧版本、更新 FTS5，并写入带新出处的更正。语义树按同一个有效版本集合生成快照。报告检查新旧原文在各时点是否正确出现。旧文在 SQLite 中可查，当前召回候选使用有效版本。
 - **指标** 每种方法最终各返回最多 `K` 条，默认 `K=3`。各次 RRF 的常数均为 60，每次融合的每个排序通道最多提供 `3K` 条候选。全证据命中要求找齐该题标注的全部原文，且结果里没有当时不可见的版本。报告列出整题和子问题的排名，以及最终召回原文和出处。
 
-这版使用内存 SQLite 和固定的分叉，评估原文召回和需逐条打分的原文量。实际耗时还受节点导航、索引维护和语料规模影响。分叉自动生成、动态重平衡和真实对话上的表现有待验证。
+上述 Python 检索基线使用内存 SQLite 和固定的分叉，评估原文召回和需逐条打分的原文量。实际耗时还受节点导航、索引维护和语料规模影响。分叉自动生成、动态重平衡和真实对话上的表现有待验证。

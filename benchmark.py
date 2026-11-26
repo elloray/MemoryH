@@ -11,8 +11,8 @@ import json
 from math import sqrt
 from pathlib import Path
 import re
-import sqlite3
-import unicodedata
+
+from retrieval_storage import RustStorage, lexical_search, open_retrieval_store
 
 
 MODEL = "BAAI/bge-small-zh-v1.5"
@@ -73,64 +73,11 @@ def descendants(node):
         yield from descendants(child)
 
 
-def lexical_terms(text):
-    # Each overlapping Han bigram is one FTS token. Latin words stay whole.
-    for part in re.findall(r"[\u3400-\u9fff]+|[a-zA-Z0-9]+", unicodedata.normalize("NFKC", text)):
-        if len(part) > 1 and "\u3400" <= part[0] <= "\u9fff":
-            yield from (part[i:i + 2] for i in range(len(part) - 1))
-        else:
-            yield part
+def query_variants(question, *, storage="sqlite"):
+    if storage == "rust":
+        from memoryh_store import query_variants as native_variants
 
-
-def initialize_database(db):
-    db.executescript("""
-        CREATE TABLE memory (
-            id TEXT PRIMARY KEY,
-            memory_key TEXT NOT NULL,
-            source TEXT NOT NULL,
-            body TEXT NOT NULL,
-            active INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0, 1))
-        );
-        CREATE UNIQUE INDEX active_memory_key ON memory(memory_key) WHERE active = 1;
-        CREATE VIRTUAL TABLE memory_fts USING fts5(id UNINDEXED, terms, tokenize='unicode61');
-    """)
-
-
-def save_memories(db, records):
-    with db:
-        for record in records:
-            old = record.get("supersedes")
-            if old:
-                updated = db.execute(
-                    "UPDATE memory SET active = 0 WHERE id = ? AND memory_key = ? AND active = 1",
-                    (old, record["key"]),
-                )
-                if updated.rowcount != 1:
-                    raise ValueError(f"更正未找到有效的旧版本：{old}")
-                db.execute("DELETE FROM memory_fts WHERE id = ?", (old,))
-            db.execute(
-                "INSERT INTO memory(id, memory_key, source, body) VALUES (?, ?, ?, ?)",
-                (record["id"], record["key"], record["source"], record["text"]),
-            )
-            db.execute(
-                "INSERT INTO memory_fts(id, terms) VALUES (?, ?)",
-                (record["id"], " ".join(lexical_terms(record["text"]))),
-            )
-
-
-def lexical_search(db, question, limit):
-    terms = dict.fromkeys(lexical_terms(question))
-    if not terms:
-        return []
-    expression = " OR ".join(f'"{term}"' for term in terms)
-    return [row[0] for row in db.execute(
-        "SELECT f.id FROM memory_fts f JOIN memory m ON m.id = f.id "
-        "WHERE memory_fts MATCH ? AND m.active = 1 ORDER BY f.rank, f.id LIMIT ?",
-        (expression, limit),
-    )]
-
-
-def query_variants(question):
+        return native_variants(question)
     clauses = re.split(r"[？?；;。！!]|另外|以及|并且|还有", question)
     clauses = [clause.strip(" ，,、") for clause in clauses]
     clauses = [clause for clause in clauses if len(clause) >= 4]
@@ -159,9 +106,13 @@ def route(node_vectors, vector, root=TREE, beam_width=BEAM_WIDTH):
     return [node.label for node, _ in frontier]
 
 
-def index_tree(active_keys, memory_vectors, root=TREE):
+def assign_leaves(active_keys, root):
     labels = {node.key_prefix: node.label for node in descendants(root) if node.key_prefix}
-    assignments = {memory_id: labels[key.split(".", 1)[0]] for memory_id, key in active_keys.items()}
+    return {memory_id: labels[key.split(".", 1)[0]] for memory_id, key in active_keys.items()}
+
+
+def index_tree(active_keys, memory_vectors, root=TREE):
+    assignments = assign_leaves(active_keys, root)
     members = defaultdict(list)
     for memory_id, label in assignments.items():
         members[label].append(memory_id)
@@ -244,27 +195,65 @@ def combined_rankings(whole, subqueries, top_k):
     return rankings
 
 
-def run_benchmark(fixture, model, top_k):
+class BenchmarkSearch:
+    """Adapt ranking output for reports while preserving the SQLite baseline."""
+
+    def __init__(self, store, memory_vectors, root=TREE, *, semantic=False):
+        self.store = store
+        self.active_keys = store.active_keys()
+        self.memory_vectors = memory_vectors
+        self.root = root
+        if isinstance(store, RustStorage):
+            self.prefixes = [
+                [(leaf.label, leaf.key_prefix) for leaf in branch.children]
+                for branch in root.children
+            ] if not semantic else None
+        else:
+            self.leaves, _, self.node_vectors = index_tree(self.active_keys, memory_vectors, root)
+
+    def search(self, variants, vectors, top_k, beam_width=BEAM_WIDTH):
+        if isinstance(self.store, RustStorage):
+            whole, parts, flat_split, tree_split, flat_first, tree_first = self.store.search(
+                variants, vectors, top_k, beam_width, self.prefixes,
+            )
+
+            def unpack(row):
+                lexical, flat, tree, flat_vector, tree_vector, routes = row
+                return RetrievalResult({"fts": lexical, "flat": flat, "tree": tree}, flat_vector, tree_vector, routes)
+
+            whole = unpack(whole)
+            subqueries = {text: unpack(row) for text, row in zip(variants[1:], parts, strict=True)}
+            rankings = dict(whole.rankings, flat_split=flat_split, tree_split=tree_split,
+                            flat_vector_first=flat_first, tree_vector_first=tree_first)
+            return whole, subqueries, rankings
+
+        def run(text, embeddings):
+            return search_query(self.store.lexical_db, text, embeddings, self.active_keys, self.memory_vectors,
+                                self.leaves, self.node_vectors, top_k * 3, self.root, beam_width=beam_width)
+
+        whole = run(variants[0], vectors)
+        subqueries = {text: run(text, [vector]) for text, vector in zip(variants[1:], vectors[1:], strict=True)}
+        return whole, subqueries, combined_rankings(whole, subqueries, top_k)
+
+
+def run_benchmark(fixture, model, top_k, *, storage="sqlite"):
     questions = fixture["questions"]
     records = fixture["memories"] + fixture["corrections"]
-    variants = {question["id"]: query_variants(question["text"]) for question in questions}
+    variants = {question["id"]: query_variants(question["text"], storage=storage) for question in questions}
     by_text = embed_texts(model, (record["text"] for record in records))
     memory_vectors = {record["id"]: by_text[record["text"]] for record in records}
     query_vectors = embed_texts(model, (QUERY_PREFIX + text for group in variants.values() for text in group))
     results = {}
+    evidence = {}
     leaf_counts = {}
-    candidate_limit = top_k * 3
 
-    with closing(sqlite3.connect(":memory:")) as db:
-        initialize_database(db)
+    with open_retrieval_store(storage) as store:
         for stage, additions in (("before", fixture["memories"]), ("after", fixture["corrections"])):
-            save_memories(db, additions)
-            active_keys = dict(db.execute("SELECT id, memory_key FROM memory WHERE active = 1"))
-            indexed_ids = [row[0] for row in db.execute("SELECT id FROM memory_fts")]
-            if sorted(active_keys) != sorted(indexed_ids):
-                raise RuntimeError("SQLite 原文与 FTS5 当前版本不一致")
-            leaves, assignments, node_vectors = index_tree(active_keys, memory_vectors)
-            leaf_counts[stage] = {label: len(ids) for label, ids in sorted(leaves.items())}
+            store.apply(additions, memory_vectors)
+            search = BenchmarkSearch(store, memory_vectors)
+            active_keys = search.active_keys
+            assignments = assign_leaves(active_keys, TREE)
+            leaf_counts[stage] = dict(Counter(assignments.values()))
             for question in questions:
                 if question["stage"] != stage:
                     continue
@@ -275,26 +264,24 @@ def run_benchmark(fixture, model, top_k):
                 expected_leaves = [assignments[mid] for mid in question["expected"]]
                 if question["group"] == "跨分支" and len(set(expected_leaves)) < 2:
                     raise ValueError(f"跨分支用例的证据落在同一叶子：{question['id']}")
-                whole_text, *clauses = variants[question["id"]]
-                vectors = [query_vectors[QUERY_PREFIX + text] for text in (whole_text, *clauses)]
-                whole = search_query(
-                    db, whole_text, vectors, active_keys, memory_vectors, leaves, node_vectors, candidate_limit,
-                )
-                subqueries = {
-                    clause: search_query(
-                        db, clause, [vector], active_keys, memory_vectors, leaves, node_vectors, candidate_limit,
-                    )
-                    for clause, vector in zip(clauses, vectors[1:], strict=True)
-                }
-                rankings = combined_rankings(whole, subqueries, top_k)
+                texts = variants[question["id"]]
+                vectors = [query_vectors[QUERY_PREFIX + text] for text in texts]
+                whole, subqueries, rankings = search.search(texts, vectors, top_k)
+                selected = dict.fromkeys(memory_id for method in METHODS for memory_id in rankings[method][:top_k])
+                evidence.update((memory_id, store.read(memory_id)) for memory_id in selected)
                 results[question["id"]] = QuestionResult(whole, subqueries, rankings, expected_leaves)
 
+        for record in records:
+            memory_id = record["id"]
+            if memory_id not in evidence:
+                evidence[memory_id] = store.read(memory_id)
+            if evidence[memory_id] is None:
+                raise RuntimeError(f"存储中没有原文：{memory_id}")
         for record in fixture["corrections"]:
-            old = db.execute("SELECT active, body FROM memory WHERE id = ?", (record["supersedes"],)).fetchone()
-            if not old or old[0] or not old[1]:
-                raise RuntimeError(f"更正后未保留旧版原文：{record['supersedes']}")
-        # Read both current and archived text back from the source of truth for the report.
-        evidence = {row[0]: (row[1], row[2]) for row in db.execute("SELECT id, source, body FROM memory")}
+            old_id = record["supersedes"]
+            old = store.read(old_id)
+            if old_id in active_keys or not old or not old[1]:
+                raise RuntimeError(f"更正后未保留旧版原文：{old_id}")
     return results, evidence, leaf_counts
 
 
@@ -312,11 +299,11 @@ def metrics(questions, results, method, top_k):
     return f"{complete}/{len(questions)}", f"{found}/{expected}", stale
 
 
-def print_cross_branch_ranks(questions, results, top_k):
+def print_cross_branch_ranks(questions, results, top_k, lexical):
     print("\n## 整题检索的跨分支证据排名\n")
-    print(f"数字越小排名越高。FTS5 和向量每路最多前 {top_k * 3} 条进入 RRF，"
+    print(f"数字越小排名越高。{lexical} 和向量每路最多前 {top_k * 3} 条进入 RRF，"
           f"最终只取前 {top_k} 条。`—` 表示这一步的列表中没有该证据。\n")
-    print("| 问题 | 证据 | FTS5 候选 | 扁平向量原始排名 | 树内向量原始排名 | 扁平 RRF | 树 RRF |")
+    print(f"| 问题 | 证据 | {lexical} 候选 | 扁平向量原始排名 | 树内向量原始排名 | 扁平 RRF | 树 RRF |")
     print("|---|---|---:|---:|---:|---:|---:|")
     for question in questions:
         result = results[question["id"]].whole
@@ -330,11 +317,11 @@ def print_cross_branch_ranks(questions, results, top_k):
             print(f"| {question['id']} | `{memory_id}` | {ranks} |")
 
 
-def print_subquery_ranks(results, top_k):
+def print_subquery_ranks(results, top_k, lexical):
     print("\n## 子问题独立检索\n")
     print(f"各列显示该子问题的前 {top_k} 条原文。拆分方案按题面顺序从各子问题的 RRF 排名轮流取原文。"
           "向量优先方案先保留各子问题的向量第 1 名，再用同样的方式补齐。合并时按原文 ID 去重。\n")
-    print("| 题号 | 子问题 | FTS5 | 扁平向量 | 扁平 RRF | 树向量 | 树 RRF |")
+    print(f"| 题号 | 子问题 | {lexical} | 扁平向量 | 扁平 RRF | 树向量 | 树 RRF |")
     print("|---|---|---|---|---|---|---|")
     for question_id, result in sorted(results.items()):
         for text, subquery in result.subqueries.items():
@@ -347,12 +334,14 @@ def print_subquery_ranks(results, top_k):
             print(f"| {question_id} | {text} | " + " | ".join(cells) + " |")
 
 
-def print_report(fixture, results, evidence, leaf_counts, top_k):
+def print_report(fixture, results, evidence, leaf_counts, top_k, *, storage="sqlite"):
     questions = fixture["questions"]
+    lexical = "Rust BM25" if storage == "rust" else "FTS5"
+    methods = {method: label.replace("FTS5", lexical) for method, label in METHODS.items()}
     print("# MemoryH 中文记忆检索实验\n")
     print(f"{len(evidence)} 条原文版本，{len(questions)} 个问题或时点。最终结果预算均为 Top {top_k}。"
           f"混合路线共用 `{MODEL}` 和 RRF 常数 {RRF_CONSTANT}，每次查询每路至多 {top_k * 3} 条融合候选。\n")
-    print("| 用例 | " + " | ".join(METHODS.values()) + " |")
+    print("| 用例 | " + " | ".join(methods.values()) + " |")
     print("|---|" + "---:|" * len(METHODS))
     groups = {group: [q for q in questions if q["group"] == group]
               for group in dict.fromkeys(q["group"] for q in questions)}
@@ -367,7 +356,7 @@ def print_report(fixture, results, evidence, leaf_counts, top_k):
     print("| 全部 | " + " | ".join(f"{complete} 题 · {found} 条" for complete, found, _ in totals.values()) + " |")
 
     print("\n题数按找齐该题的全部原文且无禁止版本计算。条数按找回的证据原文计算。")
-    stale = "、".join(f"{label} {totals[method][2]} 题" for method, label in METHODS.items())
+    stale = "、".join(f"{label} {totals[method][2]} 题" for method, label in methods.items())
     print(f"\n禁止版本误召回为 {stale}。\n")
     unsplit = [result for result in results.values() if not result.subqueries]
     print(f"有 {len(results) - len(unsplit)} 题识别出多个子问题。其余 {len(unsplit)} 题复用整题检索结果。\n")
@@ -379,9 +368,9 @@ def print_report(fixture, results, evidence, leaf_counts, top_k):
         print(f"- {STAGES[stage]}的叶子条数为 " + "、".join(f"{label} {count}" for label, count in counts.items()) + "。")
 
     if cross_branch := groups.get("跨分支"):
-        print_cross_branch_ranks(cross_branch, results, top_k)
+        print_cross_branch_ranks(cross_branch, results, top_k, lexical)
     if len(unsplit) < len(results):
-        print_subquery_ranks(results, top_k)
+        print_subquery_ranks(results, top_k, lexical)
 
     print("\n## 逐题召回原文")
 
@@ -399,7 +388,7 @@ def print_report(fixture, results, evidence, leaf_counts, top_k):
         evidence_lists = [("应找回", question["expected"])]
         if question.get("forbidden"):
             evidence_lists.append(("禁止版本", question["forbidden"]))
-        evidence_lists.extend((label, result.rankings[method][:top_k]) for method, label in METHODS.items())
+        evidence_lists.extend((label, result.rankings[method][:top_k]) for method, label in methods.items())
         for label, ids in evidence_lists:
             print(f"**{label}**\n")
             print("\n".join(f"- {format_evidence(memory_id)}" for memory_id in ids) or "无结果。")
@@ -407,24 +396,28 @@ def print_report(fixture, results, evidence, leaf_counts, top_k):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="对比中文记忆的 FTS5、FTS5 + 扁平向量和 FTS5 + 语义二叉树召回")
+    parser = argparse.ArgumentParser(description="对比中文记忆的关键词、扁平向量混合和二叉树混合召回")
     parser.add_argument("--top-k", type=int, default=3, help="每种方法返回的原文条数，默认 3")
+    parser.add_argument("--storage", choices=("sqlite", "rust"), default="sqlite", help="存储与检索后端")
     args = parser.parse_args()
     if args.top_k < 1:
         parser.error("--top-k 必须大于零")
 
-    try:
-        with closing(sqlite3.connect(":memory:")) as db:
-            db.execute("CREATE VIRTUAL TABLE probe USING fts5(text)")
-    except sqlite3.OperationalError as error:
-        parser.exit(2, f"当前 Python 的 SQLite 无法启用 FTS5（{error}）。\n")
+    if args.storage == "sqlite":
+        import sqlite3
+
+        try:
+            with closing(sqlite3.connect(":memory:")) as db:
+                db.execute("CREATE VIRTUAL TABLE probe USING fts5(text)")
+        except sqlite3.OperationalError as error:
+            parser.exit(2, f"当前 Python 的 SQLite 无法启用 FTS5（{error}）。\n")
 
     from fastembed import TextEmbedding
 
     fixture = json.loads(Path(__file__).with_name("cases.json").read_text(encoding="utf-8"))
     model = TextEmbedding(MODEL, threads=2)
-    report = run_benchmark(fixture, model, args.top_k)
-    print_report(fixture, *report, args.top_k)
+    report = run_benchmark(fixture, model, args.top_k, storage=args.storage)
+    print_report(fixture, *report, args.top_k, storage=args.storage)
 
 
 if __name__ == "__main__":
