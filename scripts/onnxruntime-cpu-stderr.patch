@@ -1,0 +1,52 @@
+diff --git a/cmake/onnxruntime_common.cmake b/cmake/onnxruntime_common.cmake
+--- a/cmake/onnxruntime_common.cmake
++++ b/cmake/onnxruntime_common.cmake
+@@ -282,10 +282,6 @@ if (onnxruntime_LINK_LIBATOMIC)
+   list(APPEND onnxruntime_EXTERNAL_LIBRARIES atomic)
+ endif()
+
+-if(APPLE)
+-  target_link_libraries(onnxruntime_common PRIVATE "-framework Foundation")
+-endif()
+-
+ if(CPUINFO_SUPPORTED)
+   # Link cpuinfo if supported
+   onnxruntime_add_include_to_target(onnxruntime_common cpuinfo::cpuinfo)
+diff --git a/onnxruntime/core/platform/logging/make_platform_default_log_sink.cc b/onnxruntime/core/platform/logging/make_platform_default_log_sink.cc
+--- a/onnxruntime/core/platform/logging/make_platform_default_log_sink.cc
++++ b/onnxruntime/core/platform/logging/make_platform_default_log_sink.cc
+@@ -5,8 +5,6 @@
+
+ #if defined(__ANDROID__)
+ #include "core/platform/android/logging/android_log_sink.h"
+-#elif defined(__APPLE__)
+-#include "core/platform/apple/logging/apple_log_sink.h"
+ #else
+ #include "core/common/logging/sinks/clog_sink.h"
+ #endif
+@@ -17,8 +15,6 @@
+ std::unique_ptr<ISink> MakePlatformDefaultLogSink() {
+ #if defined(__ANDROID__)
+   return std::make_unique<AndroidLogSink>();
+-#elif defined(__APPLE__)
+-  return std::make_unique<AppleLogSink>();
+ #else
+   return std::make_unique<CLogSink>();
+ #endif
+diff --git a/cmake/external/abseil-cpp.cmake b/cmake/external/abseil-cpp.cmake
+--- a/cmake/external/abseil-cpp.cmake
++++ b/cmake/external/abseil-cpp.cmake
+@@ -44,6 +44,13 @@ onnxruntime_fetchcontent_declare(
+ )
+
+ onnxruntime_fetchcontent_makeavailable(abseil_cpp)
++if(APPLE)
++  # ORT's CPU library does not use Abseil's CoreFoundation local-timezone lookup.
++  get_target_property(absl_time_zone_target absl::time_zone ALIASED_TARGET)
++  get_target_property(absl_time_zone_deps ${absl_time_zone_target} INTERFACE_LINK_LIBRARIES)
++  list(FILTER absl_time_zone_deps EXCLUDE REGEX "CoreFoundation")
++  set_property(TARGET ${absl_time_zone_target} PROPERTY INTERFACE_LINK_LIBRARIES "${absl_time_zone_deps}")
++endif()
+ FetchContent_GetProperties(abseil_cpp)
+ if(abseil_cpp_SOURCE_DIR)
+   set(ABSEIL_SOURCE_DIR ${abseil_cpp_SOURCE_DIR})

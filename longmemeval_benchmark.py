@@ -4,12 +4,10 @@
 # ///
 
 import argparse
-from contextlib import closing
 import hashlib
 import importlib.util
 import json
 from pathlib import Path
-import sqlite3
 from statistics import mean
 import sys
 from tempfile import NamedTemporaryFile
@@ -17,11 +15,9 @@ from tempfile import NamedTemporaryFile
 import numpy as np
 from rank_bm25 import BM25Okapi
 
-from benchmark import (
-    RRF_CONSTANT, combined_rankings, index_tree, initialize_database, normalized,
-    query_variants, save_memories, search_query,
-)
+from benchmark import RRF_CONSTANT, BenchmarkSearch, normalized, query_variants
 from locomo_benchmark import ROOT, assign_leaf_keys
+from retrieval_storage import open_retrieval_store
 
 
 DATA_REVISION = "98d7416c24c778c2fee6e6f3006e7a073259d48f"
@@ -117,28 +113,22 @@ class TorchBGE:
             self.torch.mps.empty_cache()
 
 
-def memoryh_rankings(entry, texts, by_text):
+def memoryh_rankings(entry, texts, by_text, *, storage="sqlite"):
     # Ranking uses neutral position IDs. IDs containing the official gold marker stay in scoring.
     records = [{"id": f"S{position:04d}", "text": text, "source": date}
                for position, (text, date) in enumerate(zip(texts, entry["haystack_dates"], strict=True))]
     memory_vectors = {record["id"]: by_text[record["text"]] for record in records}
-    keys = dict(assign_leaf_keys(records, memory_vectors))
-    leaves, _, node_vectors = index_tree(keys, memory_vectors, ROOT)
-    variants = query_variants(entry["question"])
+    keys = dict(assign_leaf_keys(records, memory_vectors)) if storage == "sqlite" else {
+        record["id"]: record["id"] for record in records
+    }
+    variants = query_variants(entry["question"], storage=storage)
     vectors = [by_text[QUERY_PREFIX + variant] for variant in variants]
     rankings = {}
-    with closing(sqlite3.connect(":memory:")) as db:
-        initialize_database(db)
-        save_memories(db, (dict(record, key=keys[record["id"]]) for record in records))
+    with open_retrieval_store(storage) as store:
+        store.apply((dict(record, key=keys[record["id"]]) for record in records), memory_vectors)
+        search = BenchmarkSearch(store, memory_vectors, ROOT, semantic=True)
         for width in (2, 3):
-            whole = search_query(db, variants[0], vectors, keys, memory_vectors, leaves, node_vectors,
-                                 MAX_K * 3, ROOT, beam_width=width)
-            parts = {
-                text: search_query(db, text, [vector], keys, memory_vectors, leaves, node_vectors,
-                                   MAX_K * 3, ROOT, beam_width=width)
-                for text, vector in zip(variants[1:], vectors[1:], strict=True)
-            }
-            combined = combined_rankings(whole, parts, MAX_K)
+            _, _, combined = search.search(variants, vectors, MAX_K, beam_width=width)
             if width == 2:
                 rankings["fts"] = combined["fts"]
                 rankings["flat"] = combined["flat_vector_first"]
@@ -146,9 +136,10 @@ def memoryh_rankings(entry, texts, by_text):
     return {method: [int(item[1:]) for item in ranks[:MAX_K]] for method, ranks in rankings.items()}
 
 
-def evaluate(entries, scorer, model, prediction_path, embedding_cache):
+def evaluate(entries, scorer, model, prediction_path, embedding_cache, *, storage="sqlite"):
     corpora = [official_corpus(entry) for entry in entries]
-    questions = [QUERY_PREFIX + text for entry in entries for text in query_variants(entry["question"])]
+    questions = [QUERY_PREFIX + text for entry in entries
+                 for text in query_variants(entry["question"], storage=storage)]
     texts = [text for corpus, _ in corpora for text in corpus] + questions
     by_text = embed_corpus(model, texts, embedding_cache)
 
@@ -158,7 +149,7 @@ def evaluate(entries, scorer, model, prediction_path, embedding_cache):
             official = BM25Okapi([text.split(" ") for text in texts])
             bm25 = official.get_scores(entry["question"].split(" "))
             rankings = {"official_bm25": np.argsort(bm25)[::-1][:MAX_K].tolist()}
-            rankings.update(memoryh_rankings(entry, texts, by_text))
+            rankings.update(memoryh_rankings(entry, texts, by_text, storage=storage))
             correct_docs = list({corpus_id for corpus_id in labels if "answer" in corpus_id})
             methods = {}
             for method, positions in rankings.items():
@@ -171,6 +162,7 @@ def evaluate(entries, scorer, model, prediction_path, embedding_cache):
                                    "metrics": metrics}
             result = {
                 "question_id": entry["question_id"], "question_type": entry["question_type"],
+                "storage": storage,
                 "scored_evidence": sorted(correct_docs), "methods": methods,
             }
             results.append(result)
@@ -201,6 +193,7 @@ def export_generation_input(entries, results, method, path):
 
 
 def print_report(results):
+    lexical = "Rust BM25" if results and results[0].get("storage") == "rust" else "FTS5"
     valid = [row for row in results if "_abs" not in row["question_id"]]
     has_gold = [row for row in valid if row["scored_evidence"]]
     print("# MemoryH · LongMemEval-S 官方检索评测\n")
@@ -213,7 +206,7 @@ def print_report(results):
     for method, label in METHODS.items():
         values = [mean(row["methods"][method]["metrics"][key] for row in valid)
                   for key in ("recall_all@5", "ndcg_any@5", "recall_all@10", "ndcg_any@10")]
-        print(f"| {label} | " + " | ".join(f"{value:.2%}" for value in values) + " |")
+        print(f"| {label.replace('FTS5', lexical)} | " + " | ".join(f"{value:.2%}" for value in values) + " |")
     print(f"\n官方脚本跳过 {len(results) - len(valid)} 道 abstention 题。"
           f"会话重标后有 {len(valid) - len(has_gold)} 道可答题没有正例，官方评分器对此记 Recall-All 1、nDCG 0。\n")
     print("## 有会话正例的题\n")
@@ -222,7 +215,7 @@ def print_report(results):
     print("|---|---:|---:|")
     for method, label in METHODS.items():
         scores = [mean(row["methods"][method]["metrics"][f"recall_all@{k}"] for row in has_gold) for k in TOP_KS]
-        print(f"| {label} | {scores[0]:.2%} | {scores[1]:.2%} |")
+        print(f"| {label.replace('FTS5', lexical)} | {scores[0]:.2%} | {scores[1]:.2%} |")
 
 
 def main():
@@ -235,6 +228,7 @@ def main():
     parser.add_argument("--generation-method", choices=METHODS, default="flat")
     parser.add_argument("--embed-backend", choices=("fastembed", "mps", "torch-cpu"), default="fastembed")
     parser.add_argument("--embedding-cache", type=Path, help="分批保存 BGE 向量，便于中断后继续")
+    parser.add_argument("--storage", choices=("sqlite", "rust"), default="sqlite", help="存储与检索后端")
     args = parser.parse_args()
     if not args.reuse and not args.official_scorer:
         parser.error("新跑检索时需要 --official-scorer")
@@ -258,7 +252,7 @@ def main():
         else:
             model = TorchBGE("mps" if args.embed_backend == "mps" else "cpu")
         scorer = load_official_scorer(args.official_scorer)
-        results = evaluate(entries, scorer, model, args.predictions, cache)
+        results = evaluate(entries, scorer, model, args.predictions, cache, storage=args.storage)
     if args.generation_input:
         export_generation_input(entries, results, args.generation_method, args.generation_input)
     print_report(results)
