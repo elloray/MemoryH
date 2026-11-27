@@ -65,7 +65,11 @@ impl Log {
                 .read(true)
                 .write(last)
                 .open(segment_path(&directory, segment))?;
-            let (file, length) = replay_segment(file, segment, last, &mut replay)?;
+            let (file, length) = replay_segment(file, segment, last, &mut |location, payload| {
+                replay(location, payload).map_err(|err| {
+                    at_batch(err, segment, location.offset - FRAME_HEADER_SIZE as u64)
+                })
+            })?;
             if last {
                 active = Some((segment, file, length));
             }
@@ -91,6 +95,15 @@ impl Log {
             fail_next_sync: false,
             _lock: lock,
         })
+    }
+
+    /// Read verified, complete frames under the source store's exclusive handle.
+    pub(crate) fn visit_committed(&self, mut visit: impl FnMut(&[u8]) -> Result<()>) -> Result<()> {
+        for segment in 1..=self.segment {
+            let file = File::open(segment_path(&self.directory, segment))?;
+            replay_segment(file, segment, false, &mut |_, payload| visit(payload))?;
+        }
+        Ok(())
     }
 
     pub(crate) fn append_frame(&mut self, payload: &[u8]) -> Result<Location> {
@@ -295,8 +308,7 @@ fn replay_segment(
                 offset: start,
             },
             &payload,
-        )
-        .map_err(|error| at_batch(error, segment, offset))?;
+        )?;
         offset = start + len as u64;
     }
     let mut file = reader.into_inner();

@@ -1,14 +1,9 @@
 //! Native CPU inference for the Chinese BGE Small v1.5 model.
 
-use std::collections::HashMap;
-use std::fmt::Display;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use ort::session::{
-    Session,
-    builder::{AutoDevicePolicy, GraphOptimizationLevel},
-};
+use ort::session::Session;
 use ort::value::Tensor;
 use tokenizers::{PaddingParams, Tokenizer, TruncationParams};
 
@@ -17,6 +12,8 @@ use crate::{
     Error, Mutation, Options, Query, Record, Result, SearchMethod, SearchOptions, SharedStore,
     Store,
 };
+
+use crate::inference::{apply_encoded, cpu_session, inference_error};
 
 pub const MODEL_NAME: &str = "BAAI/bge-small-zh-v1.5";
 pub const MODEL_REVISION: &str = "46fbe35fd4374a00fee7de77dfddaeb6dd6a2c59";
@@ -39,9 +36,6 @@ impl BgeSmallZh {
         runtime_library: impl AsRef<Path>,
         threads: usize,
     ) -> Result<Self> {
-        if threads == 0 {
-            return Err(Error::Embedding("thread count must be positive".into()));
-        }
         let model_dir = model_dir.as_ref();
         let tokenizer_path = model_dir.join("tokenizer.json");
         let mut tokenizer = Tokenizer::from_file(&tokenizer_path)
@@ -60,26 +54,11 @@ impl BgeSmallZh {
             ..Default::default()
         }));
 
-        ort::init_from(runtime_library.as_ref().canonicalize()?)
-            .map_err(inference_error)?
-            .commit();
-        // Match FastEmbed's device selection and memory arena on CPU.
-        let session = Session::builder()
-            .map_err(inference_error)?
-            .with_auto_device(AutoDevicePolicy::Default)
-            .map_err(inference_error)?
-            .with_no_environment_execution_providers()
-            .map_err(inference_error)?
-            .with_execution_providers([ort::ep::CPU::default().with_arena_allocator(true).build()])
-            .map_err(inference_error)?
-            .with_optimization_level(GraphOptimizationLevel::All)
-            .map_err(inference_error)?
-            .with_intra_threads(threads)
-            .map_err(inference_error)?
-            .with_inter_threads(threads)
-            .map_err(inference_error)?
-            .commit_from_file(model_dir.join("model_optimized.onnx"))
-            .map_err(inference_error)?;
+        let session = cpu_session(
+            &model_dir.join("model_optimized.onnx"),
+            runtime_library.as_ref(),
+            threads,
+        )?;
         Ok(Self { tokenizer, session })
     }
 
@@ -132,10 +111,6 @@ impl BgeSmallZh {
     }
 }
 
-fn inference_error(error: impl Display) -> Error {
-    Error::Embedding(error.to_string())
-}
-
 /// A MemoryH store with a resident BGE encoder for text input.
 #[derive(Clone)]
 pub struct BgeStore {
@@ -173,34 +148,28 @@ impl BgeStore {
 
     /// Encode new and corrected text, then commit original records and vectors together.
     pub fn apply(&self, mutations: &[Mutation]) -> Result<u64> {
-        let mut by_text = HashMap::new();
-        let mut texts = Vec::new();
-        let positions: Vec<_> = mutations
-            .iter()
-            .map(|mutation| {
-                let memory = match mutation {
-                    Mutation::Put(memory) | Mutation::Replace { memory, .. } => memory,
-                    Mutation::Retract { .. } => return None,
-                };
-                Some(*by_text.entry(memory.body.as_str()).or_insert_with(|| {
-                    texts.push(memory.body.as_str());
-                    texts.len() - 1
-                }))
-            })
-            .collect();
-        let embeddings = self.encoder.lock().unwrap().embed(&texts)?;
-        let vectors: Vec<_> = positions
-            .into_iter()
-            .map(|position| position.map(|index| embeddings[index].as_slice()))
-            .collect();
-        self.store.apply_with_embeddings(mutations, &vectors)
+        apply_encoded(&self.store, mutations, |texts| {
+            self.encoder.lock().unwrap().embed(texts)
+        })
     }
 
-    /// Search raw question text and return up to three originals via flat hybrid search.
+    /// The historical BGE hybrid baseline.
     pub fn retrieve(&self, question: &str) -> Result<Vec<Record>> {
         self.retrieve_with_options(question, &SearchOptions::default(), SearchMethod::Flat)
     }
 
+    fn embed_questions(&self, variants: &[&str]) -> Result<Vec<Vec<f32>>> {
+        let prefixed: Vec<_> = variants
+            .iter()
+            .map(|s| format!("{QUERY_PREFIX}{s}"))
+            .collect();
+        self.encoder
+            .lock()
+            .unwrap()
+            .embed(&prefixed.iter().map(String::as_str).collect::<Vec<_>>())
+    }
+
+    /// Explicit historical ranking modes for diagnostics and benchmark comparisons.
     pub fn retrieve_with_options(
         &self,
         question: &str,
@@ -219,12 +188,7 @@ impl BgeStore {
         }
 
         let variants = query_variants(question);
-        let prefixed: Vec<_> = variants
-            .iter()
-            .map(|text| format!("{QUERY_PREFIX}{text}"))
-            .collect();
-        let input: Vec<_> = prefixed.iter().map(String::as_str).collect();
-        let vectors = self.encoder.lock().unwrap().embed(&input)?;
+        let vectors = self.embed_questions(&variants)?;
         let queries: Vec<_> = variants
             .into_iter()
             .zip(&vectors)

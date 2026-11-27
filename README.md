@@ -2,9 +2,79 @@
 
 MemoryH 是面向 LLM 的嵌入式记忆存储与检索引擎。Rust 核心提供版本化持久存储、内存缓存、BM25 关键词召回、向量召回和混合排序。仓库另保留 SQLite FTS5 对照路线。
 
-在 LongMemEval-S 的 500 题上，FTS5 + 扁平向量的端到端准确率为 **84.2%**，同配置官方 BM25 为 **73.2%**，语义二叉树 Beam 3 为 **76.6%**。三条路线均将 Top 5 完整会话交给同一个 GPT-4o 快照作答并判分。[LongMemEval-S 评测报告](longmemeval-results.md)
+此前的 BGE 基线在 LongMemEval-S 的 500 题上，FTS5 + 扁平向量的端到端准确率为 **84.2%**，同配置官方 BM25 为 **73.2%**，语义二叉树 Beam 3 为 **76.6%**。三条路线均将 Top 5 完整会话交给同一个 GPT-4o 快照作答并判分。[LongMemEval-S 评测报告](longmemeval-results.md)
 
 中文合成用例对照整题检索与子问题独立检索，覆盖字面命中、同义改写、跨分支取证和记忆更正。[中文样本与证据标注](cases.json) · [逐题报告](results.md)
+
+## 一键复测 Qwen 拆题和 ScaNN
+
+在 Apple Silicon 上从仓库根目录运行。脚本检查本地三套模型，已有且校验通过的文件直接复用，缺失时下载固定快照。拆题使用 Qwen3.5-2B 的 Q4_K_M GGUF，编码和重排分别沿用 Qwen3-Embedding-0.6B INT8 ONNX 和 Yuanbao-Reranker-0.6B FP16 ONNX。脚本优先检查指定模型目录、项目默认模型目录和 Hugging Face 对应快照缓存。Yuanbao 缺少可用的 ONNX 导出时会从固定版本的原始权重在本机转换并验证。首次准备还会按需下载 llama.cpp、构建 ScaNN C++ 库及 CPU ONNX Runtime。需要 Rust、Python 3、uv、git 和 C++ 工具链。
+
+```sh
+python3 scripts/benchmark-scann.py
+```
+
+脚本通过 `QwenModels::load` 和 `QwenStore` 运行全部 21 道题，每题预热后默认计时 10 次。`--rounds 1` 可进行短测。每次运行在 `target/scann-eval/runs/` 下新建结果目录，包含 `report.md`、`summary.json`、逐题候选和计时数据 `queries.json`。可用 `--models-dir` 指向已有模型目录，或用 `--output-dir` 指定新的结果目录。[历史四组对照](scann-results.md)
+
+`QwenStore` 的查询固定使用本地 Qwen3.5-2B 拆题及原生 ScaNN。整题始终参与召回，模型返回至少两个不同子问题时也编码这些子问题。ScaNN 按有效版本快照建分区索引，更正后下次查询按需重建。28 条活跃记忆时建 5 个 k-means 分区、搜索 3 个；少于 18 条时搜索所有分区以保留小库候选。入选分区内用 float32 内积取邻居。[Qwen 官方模型](https://huggingface.co/Qwen/Qwen3.5-2B) · [ScaNN 上游](https://github.com/google-research/google-research/tree/master/scann)
+
+测试脚本自动启停本地 llama.cpp 服务。应用集成时，查询默认连接 `127.0.0.1:8080` 的拆题服务。打开 `QwenStore` 时从当前目录的 `target/scann-eval/deps/build/` 加载 ScaNN 动态库。可用 `MEMORYH_SPLITTER_ADDR` 指定其他本机地址，用 `MEMORYH_SCANN_LIB` 指定动态库文件。每个实例也可用 `with_splitter` 和 `with_scann` 修改地址和路径。库加载失败时打开存储报错，拆题请求失败时查询返回错误。准备好上述模型后，可用以下命令在独立终端启动服务。
+
+```sh
+target/scann-eval/deps/llama/llama-server \
+  -m target/memoryh-models/splitter/Qwen3.5-2B-Q4_K_M.gguf \
+  -a memoryh-qwen3.5-2b --host 127.0.0.1 --port 8080 \
+  -ngl 0 -t 2 -tb 2 -np 1 -c 2048 --reasoning off --no-cache-prompt --cache-ram 0
+```
+
+## 本地 Qwen 检索
+
+调用方把记忆原文传给 `QwenStore::apply`，把问题文本传给 `retrieve`，拿回最多三条带 ID、来源和版本的原文。拆题由本机 llama.cpp 服务执行，编码和重排在 Rust 进程中通过 ONNX Runtime CPU 执行。
+
+1. 写入时，Qwen3-Embedding-0.6B 用模型自带的 tokenizer 直接编码原文。引擎取最后一个有效 token 的隐藏状态，L2 归一化成 1,024 维向量，随原文一起提交。BM25 另外用 Rust 的 Jieba 词典分词，并保留连续的字母数字编号。
+2. 查询时，Qwen3.5-2B 先判断是否需要拆题。编码器随后处理整题和实际生成的子问题。文档和问题都使用原始文本，无额外指令前缀。本地编码入口最多接收 2,048 个 token，较长输入会截断，存储的原文保持完整。
+3. 在同一批当前有效版本上，整题及各子句分别做 BM25 和向量近邻搜索，每路各取最多 9 条。合并候选时按不可复用的记录 ID 去重。
+4. Yuanbao-Reranker-0.6B 在本地用记忆检索提示词逐条判断候选，输入包含整题和候选原文。取最后一个有效 token 的 `yes` 与 `no` 的 logit 差作为分数。这个顺序与官方双标签 softmax 概率相同。含模板的输入上限为 512 token，截断时保留判断后缀。按分数降序取 Top 3，同分按 ID 排序。[Qwen 模型卡](https://huggingface.co/Qwen/Qwen3-Embedding-0.6B) · [Yuanbao 重排模型卡](https://huggingface.co/Yuanbao-Search/Yuanbao-Reranker-0.6B)
+
+```rust
+use memoryh::{Memory, Mutation, Options};
+use memoryh::qwen::{QwenModels, QwenStore};
+
+fn search(runtime: &std::path::Path) -> memoryh::Result<()> {
+    let models = QwenModels::load("target/memoryh-models/qwen",
+        "target/memoryh-models/yuanbao", runtime, 2)?;
+    let store = QwenStore::open("memoryh-data", Options::default(), models)?;
+    store.apply(&[Mutation::Put(Memory {
+        id: "coffee-v1".into(), key: "coffee".into(), source: "对话 12".into(),
+        body: "午后喝低咖啡因拿铁。".into(),
+    })])?;
+    for hit in store.retrieve("下午怕睡不着，咖啡怎么点？")? {
+        println!("{} {}", hit.memory.source, hit.memory.body);
+    }
+    Ok(())
+}
+```
+
+在 Apple Silicon 上，准备脚本校验固定权重，首次通过 `uv` 将 Yuanbao 的 BF16 权重导出为 FP16 ONNX 并对照 Transformers 校验。查询可离线执行。已有 Qwen 向量库可直接更换 reranker。[Yuanbao 提示词与 21 题复测](yuanbao-results.md) · [先前 MiniLM 基线](qwen-results.md)
+
+```sh
+scripts/fetch-qwen-models.sh
+scripts/build-scann.sh
+bash scripts/build-onnxruntime-cpu.sh
+export ONNX_RUNTIME_LIB="$PWD/target/ort-cpu/build/Release/libonnxruntime.1.32.0.dylib"
+cargo run --locked --release --features qwen --example qwen_benchmark -- \
+  target/memoryh-models/qwen target/memoryh-models/yuanbao "$ONNX_RUNTIME_LIB" 10
+```
+
+可用 `scripts/fetch-qwen-models.sh target/memoryh-models minilm` 准备旧 mMARCO 对照，加载目录为 `target/memoryh-models/reranker`。要替换 Yuanbao 的任务提示词，可调用 `QwenModels::load_with_instruction`。基准程序支持把提示词文件路径作为最后一个可选参数。
+
+已有 BGE 或来源未知的向量库需要从原文重编码。关闭源库后运行下面的命令，`OUTPUT_PARENT` 指向已存在的输出父目录。工具按事务顺序导入原文、更正和撤回，成功后打印新库目录。应用切换到这个目录即可使用 Qwen。
+
+```sh
+cargo run --locked --release --features qwen --example qwen_reindex -- \
+  "$SOURCE_STORE" "$OUTPUT_PARENT" target/memoryh-models/qwen \
+  target/memoryh-models/yuanbao "$ONNX_RUNTIME_LIB"
+```
 
 ## Rust 存储引擎
 

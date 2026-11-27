@@ -9,7 +9,9 @@ description = "An embedded store and retrieval engine for versioned memories"
 crate-type = ["rlib", "cdylib"]
 
 [features]
-bge = ["dep:ort", "dep:tokenizers"]
+bge = ["inference"]
+qwen = ["inference", "dep:rayon", "dep:ureq", "dep:serde_json", "dep:libloading"]
+inference = ["dep:ort", "dep:tokenizers"]
 python = ["dep:pyo3"]
 
 [dependencies]
@@ -20,6 +22,11 @@ unicode-normalization = "0.1"
 ort = { version = "=2.0.0-rc.12", default-features = false, features = ["api-24", "load-dynamic"], optional = true }
 tokenizers = { version = "=0.22.2", default-features = false, features = ["onig"], optional = true }
 pyo3 = { version = "0.27", features = ["abi3-py312"], optional = true }
+jieba-rs = "0.8.1"
+rayon = { version = "1.11", optional = true }
+ureq = { version = "3.1.4", default-features = false, features = ["json"], optional = true }
+serde_json = { version = "1", optional = true }
+libloading = { version = "0.9", optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 libc = "0.2"
@@ -36,3 +43,15 @@ required-features = ["bge"]
 [[example]]
 name = "group_commit_benchmark"
 required-features = ["bge"]
+
+[[example]]
+name = "qwen_benchmark"
+required-features = ["qwen"]
+
+[[example]]
+name = "qwen_reindex"
+required-features = ["qwen"]
+
+[[example]]
+name = "scann_benchmark"
+required-features = ["qwen"]

@@ -1,5 +1,13 @@
+#[cfg(feature = "qwen")]
+pub(crate) mod scann;
+#[cfg(feature = "qwen")]
+use scann::{ScannLibrary, ScannVectors};
 use std::collections::{BTreeMap, HashMap, HashSet};
 
+use jieba_rs::Jieba;
+#[cfg(feature = "qwen")]
+use rayon::prelude::*;
+use std::sync::{Arc, LazyLock};
 use unicode_normalization::UnicodeNormalization;
 
 use crate::{Error, Result};
@@ -67,13 +75,15 @@ pub struct SearchResult {
     pub tree_vector_first: Vec<String>,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(crate) struct RetrievalIndex {
-    documents: BTreeMap<String, Document>,
-    postings: HashMap<String, BTreeMap<String, usize>>,
+    documents: BTreeMap<String, Arc<Document>>,
+    #[cfg(feature = "qwen")]
+    scann: Arc<std::sync::OnceLock<std::result::Result<Option<ScannVectors>, String>>>,
+    postings: HashMap<String, Arc<BTreeMap<String, usize>>>,
     total_terms: usize,
     pub(crate) dimension: Option<usize>,
-    tree: Option<(TreeLayout, Tree)>,
+    tree: Option<(TreeLayout, Arc<Tree>)>,
 }
 
 struct Document {
@@ -92,9 +102,7 @@ impl RetrievalIndex {
             len += 1;
         }
         for (term, count) in &terms {
-            self.postings
-                .entry(term.clone())
-                .or_default()
+            Arc::make_mut(self.postings.entry(term.clone()).or_default())
                 .insert(id.to_owned(), *count);
         }
         self.total_terms += len;
@@ -103,14 +111,14 @@ impl RetrievalIndex {
         }
         self.documents.insert(
             id.to_owned(),
-            Document {
+            Arc::new(Document {
                 key: key.into(),
                 terms,
                 len,
                 embedding,
-            },
+            }),
         );
-        self.tree = None;
+        self.invalidate_vectors();
     }
 
     pub(crate) fn remove(&mut self, id: &str) {
@@ -118,13 +126,21 @@ impl RetrievalIndex {
             self.total_terms -= document.len;
             for term in document.terms.keys() {
                 let postings = self.postings.get_mut(term).expect("indexed document term");
-                postings.remove(id);
+                Arc::make_mut(postings).remove(id);
                 if postings.is_empty() {
                     self.postings.remove(term);
                 }
             }
-            self.tree = None;
+            self.invalidate_vectors();
         }
+    }
+
+    fn invalidate_vectors(&mut self) {
+        #[cfg(feature = "qwen")]
+        {
+            self.scann = Arc::default();
+        }
+        self.tree = None;
     }
 
     pub(crate) fn lexical(&self, text: &str, limit: usize) -> Vec<String> {
@@ -145,7 +161,7 @@ impl RetrievalIndex {
             let matched = postings.len() as f64;
             let idf = ((count - matched + 0.5) / (matched + 0.5)).ln();
             let idf = if idf > 0.0 { idf } else { 1e-6 };
-            for (id, &frequency) in postings {
+            for (id, &frequency) in postings.iter() {
                 let frequency = frequency as f64;
                 let len = self.documents[id].len as f64;
                 let score =
@@ -154,6 +170,66 @@ impl RetrievalIndex {
             }
         }
         ranked(scores, limit)
+    }
+
+    /// Use one immutable generation for both channels and every query variant.
+    #[cfg(feature = "qwen")]
+    pub(crate) fn candidates(
+        &self,
+        queries: &[Query<'_>],
+        limit: usize,
+        lib: &Arc<ScannLibrary>,
+    ) -> Result<(Vec<String>, std::time::Duration)> {
+        use std::collections::BTreeSet;
+        use std::time::{Duration, Instant};
+        let start = Instant::now();
+        let searcher = if let Some(dim) = self.dimension {
+            let result = self.scann.get_or_init(|| {
+                ScannVectors::build(lib, &self.documents, dim).map_err(|e| e.to_string())
+            });
+            result
+                .as_ref()
+                .map_err(|err| Error::InvalidQuery(err.clone()))?
+                .as_ref()
+        } else {
+            None
+        };
+        let index_time = start.elapsed();
+        let pools: Result<Vec<(BTreeSet<String>, Duration)>> = queries
+            .par_iter()
+            .map(|query| {
+                let vector = query
+                    .embedding
+                    .ok_or_else(|| Error::InvalidQuery("missing query embedding".into()))?;
+                if self.dimension.is_some_and(|d| d != vector.len()) {
+                    return Err(Error::InvalidQuery(
+                        "query dimension does not match the store".into(),
+                    ));
+                }
+                let (words, semantic) = rayon::join(
+                    || self.lexical(query.text, limit),
+                    || {
+                        let start = Instant::now();
+                        let hits = match searcher {
+                            Some(index) => index.search(vector, limit),
+                            None => Ok(vec![]),
+                        };
+                        (hits, start.elapsed())
+                    },
+                );
+                Ok((words.into_iter().chain(semantic.0?).collect(), semantic.1))
+            })
+            .collect();
+        let mut ids = BTreeSet::new();
+        let mut longest_vector_search = Duration::ZERO;
+        for (pool, duration) in pools? {
+            ids.extend(pool);
+            longest_vector_search = longest_vector_search.max(duration);
+        }
+        Ok((
+            ids.into_iter().collect(),
+            index_time + longest_vector_search,
+        ))
     }
 
     pub(crate) fn search(
@@ -194,7 +270,7 @@ impl RetrievalIndex {
         {
             self.tree = Some((
                 options.tree.clone(),
-                Tree::build(&self.documents, &options.tree),
+                Arc::new(Tree::build(&self.documents, &options.tree)),
             ));
         }
         let whole = self.rank(question.text, &vectors, options);
@@ -278,33 +354,33 @@ impl RetrievalIndex {
 }
 
 fn tokenize(text: &str) -> Vec<String> {
-    fn chinese(c: char) -> bool {
-        ('\u{3400}'..='\u{9fff}').contains(&c)
-    }
-
+    static SEGMENTER: LazyLock<Jieba> = LazyLock::new(Jieba::new);
+    let normalized: String = text.nfkc().collect::<String>().to_ascii_lowercase();
+    // Split ASCII identifiers separately so serial numbers survive intact.
     let mut terms = Vec::new();
-    let mut chars = text.nfkc().peekable();
-    while let Some(c) = chars.next() {
-        if c.is_ascii_alphanumeric() {
-            let mut term = String::from(c);
-            while chars.peek().is_some_and(char::is_ascii_alphanumeric) {
-                term.push(chars.next().expect("peeked character"));
-            }
-            terms.push(term);
-        } else if chinese(c) {
-            let mut previous = c;
-            let mut has_pair = false;
-            while chars.peek().is_some_and(|c| chinese(*c)) {
-                let next = chars.next().expect("peeked character");
-                terms.push([previous, next].into_iter().collect());
-                previous = next;
-                has_pair = true;
-            }
-            if !has_pair {
-                terms.push(c.to_string());
-            }
+    let mut run = String::new();
+    let mut ascii = false;
+    let flush = |run: &mut String, ascii: bool, terms: &mut Vec<String>| {
+        if run.is_empty() {
+            return;
+        }
+        if ascii {
+            terms.push(std::mem::take(run));
+        } else {
+            terms.extend(SEGMENTER.cut(run, true).into_iter().map(str::to_owned));
+            run.clear();
+        }
+    };
+    for c in normalized.chars() {
+        if !c.is_alphanumeric() || c.is_ascii() != ascii {
+            flush(&mut run, ascii, &mut terms);
+        }
+        ascii = c.is_ascii();
+        if c.is_alphanumeric() {
+            run.push(c);
         }
     }
+    flush(&mut run, ascii, &mut terms);
     terms
 }
 
@@ -441,7 +517,7 @@ struct Leaf {
 }
 
 impl Tree {
-    fn build(documents: &BTreeMap<String, Document>, layout: &TreeLayout) -> Self {
+    fn build(documents: &BTreeMap<String, Arc<Document>>, layout: &TreeLayout) -> Self {
         let vectors: BTreeMap<_, _> = documents
             .iter()
             .filter_map(|(id, document)| {
@@ -584,4 +660,64 @@ fn partition<'a>(mut ids: Vec<&'a str>, vectors: &BTreeMap<&str, &[f32]>) -> [Ve
     });
     let right = ids.split_off(ids.len() / 2);
     [ids, right]
+}
+
+#[cfg(all(test, feature = "qwen"))]
+mod candidate_tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "requires the native ScaNN shared library"]
+    fn scann_rebuilds_after_corrections_without_changing_old_snapshots() {
+        let lib = ScannLibrary::load(&ScannLibrary::default_path()).unwrap();
+        let mut index = RetrievalIndex::default();
+        for n in 0..28 {
+            let angle = n as f32 * 0.2;
+            let id = format!("id{n:02}");
+            index.insert(&id, &id, "memory", Some(vec![angle.cos(), angle.sin()]));
+        }
+        let nearest = |index: &RetrievalIndex| {
+            index
+                .candidates(
+                    &[Query {
+                        text: "",
+                        embedding: Some(&[1., 0.]),
+                    }],
+                    1,
+                    &lib,
+                )
+                .unwrap()
+                .0
+        };
+        assert_eq!(nearest(&index), ["id00"]);
+        let old = index.clone();
+        index.remove("id00");
+        index.insert("revised", "id00", "corrected", Some(vec![1., 0.]));
+        assert_eq!(nearest(&index), ["revised"]);
+        assert_eq!(nearest(&old), ["id00"]);
+    }
+
+    #[test]
+    #[ignore = "requires the native ScaNN shared library"]
+    fn union_retains_single_channel_hits_and_deduplicates_across_clauses() {
+        let lib = ScannLibrary::load(&ScannLibrary::default_path()).unwrap();
+        let mut index = RetrievalIndex::default();
+        index.insert("lex", "k1", "预订编号 NJ042", Some(vec![0., 1.]));
+        index.insert("vec", "k2", "其他内容", Some(vec![1., 0.]));
+        let query = || Query {
+            text: "ＮＪ０４２",
+            embedding: Some(&[1., 0.]),
+        };
+        assert_eq!(
+            index.candidates(&[query(), query()], 1, &lib).unwrap().0,
+            ["lex", "vec"]
+        );
+        let old = index.clone();
+        index.remove("vec");
+        assert_eq!(index.candidates(&[query()], 1, &lib).unwrap().0, ["lex"]);
+        assert_eq!(
+            old.candidates(&[query()], 1, &lib).unwrap().0,
+            ["lex", "vec"]
+        );
+    }
 }
