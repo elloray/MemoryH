@@ -1,0 +1,43 @@
+<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MemoryH × Mem0 · LoCoMo 实时对比</title><link rel="stylesheet" href="/progress.css">
+<style>progress{width:100%;accent-color:#257455}section{overflow-x:auto}th,td{white-space:nowrap}td.question{white-space:normal;min-width:14em}header a{margin-left:1em}.num{font-variant-numeric:tabular-nums}</style>
+<header><div><b class="brand">MemoryH</b><a href="/v2">V2 进度</a><a href="/v1">S 版进度</a></div></header><main>
+<div class="lead"><div><div class="meta">LoCoMo · 英文 1,540 题</div><h1>MemoryH 与 Mem0</h1><p>GPT-5 作答与判分 · 作答最多使用 200 条记忆 · Mem0 使用公开逐题记录</p></div>
+<div class="score"><p>同题准确率差 · MemoryH 减 Mem0</p><div class="num" id="gap">—</div><p id="fraction">等待双方可比题</p></div></div>
+<section><div class="row"><h2>实时进度</h2><small id="stamp"></small></div><progress id="progress" max="1540" value="0"></progress>
+<p id="counts"></p><p id="state" role="status"></p></section>
+<section><h2>已完成题目的对比</h2><table><thead><tr><th>指标</th><th>MemoryH 本次运行</th><th>Mem0 托管版历史记录</th></tr></thead><tbody id="metrics"></tbody></table>
+<p id="wins"></p><p>准确率按相同已判题号计算。检索 P50 为中位数，P95 取最近秩。两者均按相同已检索题号计算，涵盖 MemoryH 本机检索或 Mem0 云端检索往返。作答输入 token 含提示词。</p></section>
+<section><h2>按召回条数和重排设备对比</h2><table><thead><tr><th>每路条数</th><th>重排设备</th><th>已检索</th><th>MemoryH P50 / P95（秒）</th><th>Mem0 同题 P50 / P95（秒）</th><th>MemoryH 答对 / 已判</th><th>Mem0 同题答对 / 已判</th><th>平均输入 token</th></tr></thead><tbody id="cohorts"></tbody></table><p id="paired-speed"></p></section>
+<section><h2>Yuanbao · CPU 与 M4 GPU 同题实测</h2><p id="metal-progress"></p><table><thead><tr><th>单路检索 · 每路 32 条</th><th>CPU</th><th>M4 GPU</th></tr></thead><tbody id="metal-metrics"></tbody></table><p id="metal-order"></p></section>
+<section><h2>MemoryH 单题耗时</h2><p id="profile-note">等待分阶段计时</p><table><thead><tr><th>题号</th><th>拆题</th><th>问题编码</th><th>召回</th><th>Yuanbao 打分</th><th>检索总计</th></tr></thead><tbody id="profile"></tbody></table></section>
+<section><div class="row"><h2>最近判完的题</h2><a href="/locomo-questions.csv">下载逐题 CSV</a></div><table><thead><tr><th>题号</th><th>英文问题</th><th>MemoryH</th><th>Mem0</th><th>输入 token</th></tr></thead><tbody id="recent"></tbody></table></section>
+<section><h2>Mem0 全量参照</h2><p>官宣准确率 92.5%（1,425/1,540）。同题对比使用公开记录 91.56%（1,410/1,540），检索 P95 为 6.002 秒。官网公布的 6,956 tokens 是平均检索上下文用量，逐题文件未披露实际作答输入 token。</p><a href="https://github.com/mem0ai/memory-benchmarks/tree/4b61c5d31b9c668a12b4f5e78064248a02c82d2b/results/platform">公开逐题记录 ↗</a></section>
+<footer>本机进度每 3 秒刷新 · 准确率随已判题集合变化</footer></main>
+<script>
+const el=id=>document.getElementById(id), fmt=(v,n=2)=>v==null?'—':v.toFixed(n), pct=v=>v==null?'—':fmt(v)+'%';
+function table(id,rows){el(id).replaceChildren(...rows.map(values=>{const tr=document.createElement('tr');values.forEach((v,i)=>{const td=document.createElement('td');td.textContent=v;if(id==='recent'&&i===1)td.className='question';tr.append(td)});return tr}))}
+async function refresh(){try{const response=await fetch('/locomo-status.json',{cache:'no-store'});if(!response.ok)throw Error();const d=await response.json();
+el('stamp').textContent=new Date(d.time).toLocaleTimeString('zh-CN',{timeZone:'Asia/Shanghai'})+' 北京';
+el('counts').textContent='已检索 '+d.searched+' / '+d.total+'　已作答 '+d.answered+' / '+d.total+'　已判分 '+d.judged+' / '+d.total;
+el('progress').value=d.judged;el('gap').textContent=d.judged?((d.accuracy>d.ref_accuracy?'+':'')+fmt(d.accuracy-d.ref_accuracy)+' pp'):'—';
+el('fraction').textContent='已配对 '+d.judged+' / '+d.total+' 题';
+const age=d.retrieval.updated?Math.max(0,Math.floor(Date.parse(d.time)/1000-d.retrieval.updated)):null;
+const elapsed=age!=null&&d.retrieval.detail?.includes('正在检索')?'（本题已用 '+age+' 秒）':'';
+el('state').textContent=[(d.retrieval.detail||'')+elapsed,d.grading.detail].filter(Boolean).join(' · ');
+el('wins').textContent='仅 MemoryH 答对 '+d.wins+' 题， 仅 Mem0 答对 '+d.losses+' 题。';
+table('metrics',[['同题准确率',pct(d.accuracy)+'  ('+d.correct+'/'+d.judged+')',pct(d.ref_accuracy)+'  ('+d.ref_correct+'/'+d.judged+')'],
+['平均作答输入 token',fmt(d.input_tokens,0),'未披露'],...['p50','p95'].map(k=>['检索 '+k.toUpperCase()+'（秒）',seconds(d[k]),seconds(d['ref_'+k])])]);
+function seconds(v){return v==null?'—':fmt(v/1000,3)}
+table('cohorts',(d.cohorts||[]).map(c=>[c.width,c.reranker==="mps"?"M4 GPU":"CPU",c.searched,seconds(c.p50)+' / '+seconds(c.p95),seconds(c.ref_p50)+' / '+seconds(c.ref_p95),c.correct+' / '+c.judged,c.ref_correct+' / '+c.judged,fmt(c.input_tokens,0)]));
+el('paired-speed').textContent=(d.width_comparisons||[]).map(c=>'同题复测 '+c.question_id+'，每路 200 条用时 '+seconds(c.wide.latency_ms)+' 秒，每路 32 条用时 '+seconds(c.narrow.latency_ms)+' 秒，提速 '+fmt(c.wide.latency_ms/c.narrow.latency_ms)+' 倍。').join(' ');
+const lp=d.last_profile, pr=lp?.profile, sec=v=>fmt(v/1000,3)+' s';
+el('profile-note').textContent=pr?('本题 '+pr.candidates+' 条候选 × '+pr.variants+' 个问题版本，共打分 '+pr.scored_pairs+' 对。已计时 '+d.profile_count+' 题，Yuanbao P95 '+sec(d.yuanbao_p95_ms)+'。'):'先前完成的题只有总检索耗时，等待首条分阶段计时。';
+table('profile',pr?[[lp.id,sec(pr.split_ms),sec(pr.encode_ms),sec(pr.recall_ms),sec(pr.yuanbao_ms),sec(lp.latency_ms)]]:[]);
+table('recent',d.recent.map(r=>[r.id,r.question,r.ours?'对':'错',r.ref?'对':'错',r.tokens]));
+const g=await (await fetch('/locomo-yuanbao-gpu.json',{cache:'no-store'})).json(), m=g.summary;
+el('metal-progress').textContent='GPU 已测 '+g.gpu_complete+' / '+g.planned+'，已有 CPU 同题结果 '+(m.n||0)+' / '+g.planned+'。';
+table('metal-metrics',m.n?[['检索 P50（秒）',seconds(m.cpu_p50_ms),seconds(m.gpu_p50_ms)],['检索 P95（秒）',seconds(m.cpu_p95_ms),seconds(m.gpu_p95_ms)],['Yuanbao P50（秒）',seconds(m.cpu_yuanbao_p50_ms),seconds(m.gpu_yuanbao_p50_ms)]]:[]);
+el('metal-order').textContent=m.n?('同题首条一致 '+m.top1_order+'/'+m.n+'，前五条顺序一致 '+m.top5_order+'/'+m.n+'，完整排序一致 '+m.same_order+'/'+m.n+'。'):'';
+}catch{el('state').textContent='进度连接中断，正在重试'}finally{setTimeout(refresh,3000)}}refresh();
+</script></html>

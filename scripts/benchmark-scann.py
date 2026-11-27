@@ -63,7 +63,7 @@ def fetch(url, path, digest, cached_paths=()):
         temporary.unlink(missing_ok=True)
 
 
-def prepare(models):
+def prepare(models, example="scann_benchmark"):
     subprocess.run(
         [ROOT / "scripts/fetch-qwen-models.sh", models, "yuanbao"], check=True
     )
@@ -137,7 +137,7 @@ def prepare(models):
             "--features",
             "qwen",
             "--example",
-            "scann_benchmark",
+            example,
         ],
         cwd=ROOT,
         check=True,

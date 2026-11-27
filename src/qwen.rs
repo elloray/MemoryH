@@ -40,7 +40,7 @@ pub use crate::retrieval::scann::RecallOptions;
 const TOP_K: usize = 3;
 const MODEL_MARKER: &str = "QWEN3_EMBEDDING_06B_INT8_V1";
 
-/// Resident CPU models can be shared by multiple store handles.
+/// Resident models can be shared by multiple store handles.
 #[derive(Clone)]
 pub struct QwenModels {
     encoder: Arc<Mutex<Qwen3Embedding>>,
@@ -89,7 +89,9 @@ impl QwenModels {
         let splitter = splitter::Splitter::from_env()?;
         let runtime = runtime.as_ref();
         let dir = reranker.as_ref();
-        let ranker = if dir.join("yuanbao.onnx").try_exists()? {
+        let ranker = if std::env::var_os("MEMORYH_YUANBAO_MPS_DIR").is_some()
+            || dir.join("yuanbao.onnx").try_exists()?
+        {
             Reranker::Yuanbao(yuanbao::Yuanbao::load(
                 dir,
                 runtime,
@@ -131,6 +133,8 @@ pub struct SearchProfile {
     /// Index acquisition plus the longest concurrent per-variant vector search, included in recall.
     pub vector: Duration,
     pub rerank: Duration,
+    /// Time spent scoring whole-question and subquestion/document pairs with the cross-encoder.
+    pub model_scoring: Duration,
 }
 
 #[derive(Clone)]
@@ -233,14 +237,16 @@ impl QwenStore {
             .iter()
             .map(|record| context.document(record))
             .collect();
-        let mut order = {
+        let (mut order, model_scoring) = {
             let mut ranker = self.models.reranker.lock().unwrap();
+            let scoring_start = Instant::now();
             let direct = ranker.score(&context.query(question), &documents)?;
             let aspects = variants[1..]
                 .iter()
                 .map(|aspect| ranker.score(&context.query(aspect), &documents))
                 .collect::<Result<Vec<_>>>()?;
-            evidence::evidence_order(&direct, &aspects)
+            let model_scoring = scoring_start.elapsed();
+            (evidence::evidence_order(&direct, &aspects), model_scoring)
         };
         let mut inventory_facts = BTreeMap::new();
         if plan.intent == QueryIntent::Inventory {
@@ -279,6 +285,7 @@ impl QwenStore {
             recall,
             vector,
             rerank: start.elapsed(),
+            model_scoring,
         })
     }
 }

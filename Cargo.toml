@@ -56,3 +56,7 @@ required-features = ["qwen"]
 [[example]]
 name = "scann_benchmark"
 required-features = ["qwen"]
+
+[[example]]
+name = "locomo_qwen"
+required-features = ["qwen"]

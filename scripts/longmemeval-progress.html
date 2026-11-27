@@ -1,0 +1,540 @@
+<!doctype html>
+<html lang="zh-CN">
+  <meta charset="utf-8" /><meta
+    name="viewport"
+    content="width=device-width, initial-scale=1"
+  /><title>MemoryH · LongMemEval-S 实时评测</title
+  ><style>
+    :root {
+      color-scheme: light;
+      --paper: #f7f6f1;
+      --ink: #182c26;
+      --green: #19634c;
+      --sub: #53645c;
+      --line: #c9cec4;
+      --red: #9e453e;
+      --gold: #a36d15;
+      --pale: #dfe2d8;
+      font-family:
+        "Inter",
+        -apple-system,
+        "PingFang SC",
+        sans-serif;
+      color: var(--ink);
+      background: var(--paper);
+      font-variant-numeric: tabular-nums;
+    }
+    * {
+      box-sizing: border-box;
+    }
+    body {
+      margin: 0;
+    }
+    main,
+    header > div {
+      max-width: 1140px;
+      margin: auto;
+      padding: 0 44px;
+    }
+    header {
+      border-bottom: 1px solid var(--line);
+    }
+    header > div,
+    .row,
+    .barlabel {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 16px;
+    }
+    header > div {
+      height: 64px;
+    }
+    strong {
+      font-weight: 650;
+    }
+    .brand {
+      font-size: 22px;
+      letter-spacing: -0.04em;
+    }
+    .status {
+      font-size: 13px;
+      color: var(--green);
+    }
+    .status:before {
+      content: "";
+      display: inline-block;
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: currentColor;
+      margin-right: 8px;
+    }
+    .lead {
+      display: grid;
+      grid-template-columns: 1.6fr 1fr;
+      align-items: end;
+      padding: 38px 0 30px;
+      border-bottom: 1px solid var(--ink);
+    }
+    h1 {
+      margin: 3px 0 10px;
+      font-size: clamp(39px, 6vw, 70px);
+      line-height: 1;
+      letter-spacing: -0.04em;
+      font-weight: 580;
+    }
+    .meta,
+    p,
+    small {
+      font-size: 13px;
+      color: var(--sub);
+      line-height: 1.6;
+    }
+    .lead p,
+    .score p {
+      margin: 0;
+    }
+    .score {
+      justify-self: end;
+      text-align: right;
+    }
+    .num {
+      font:
+        550 clamp(34px, 6vw, 62px) / 1.1 "Inter",
+        -apple-system,
+        sans-serif;
+      letter-spacing: -0.04em;
+      color: var(--green);
+    }
+    .stages {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 28px;
+      padding: 24px 0;
+    }
+    .stages h2 {
+      font-size: 15px;
+      margin: 0;
+    }
+    .barlabel output {
+      font:
+        16px ui-monospace,
+        monospace;
+    }
+    .track {
+      height: 5px;
+      background: var(--pale);
+      margin: 12px 0 0;
+    }
+    .track i {
+      display: block;
+      height: 100%;
+      width: 0;
+      background: var(--green);
+    }
+    section {
+      margin: 20px 0 30px;
+    }
+    .row {
+      align-items: baseline;
+    }
+    h2 {
+      font-size: 22px;
+      letter-spacing: -0.02em;
+      margin: 0 0 10px;
+    }
+    .legend {
+      display: flex;
+      gap: 14px;
+      flex-wrap: wrap;
+      font-size: 12px;
+      color: var(--sub);
+      margin: 5px 0 14px;
+    }
+    .legend i {
+      display: inline-block;
+      width: 10px;
+      height: 10px;
+      background: var(--pale);
+      margin-right: 4px;
+    }
+    .cells {
+      display: grid;
+      grid-template-columns: repeat(50, minmax(0, 1fr));
+      gap: 3px;
+    }
+    .cells span {
+      height: 10px;
+      background: var(--pale);
+      border-radius: 1px;
+    }
+    .cells .work,
+    .legend .work {
+      background: var(--gold);
+    }
+    .cells .rank,
+    .legend .rank {
+      background: #86a3a0;
+    }
+    .cells .answer,
+    .legend .answer {
+      background: #4f7984;
+    }
+    .cells .yes,
+    .legend .yes {
+      background: var(--green);
+    }
+    .cells .no,
+    .legend .no {
+      background: var(--red);
+    }
+    #active {
+      min-height: 1.5em;
+    }
+    .cols {
+      display: grid;
+      grid-template-columns: 1.1fr 1fr;
+      gap: 48px;
+      border-top: 1px solid var(--ink);
+      padding-top: 22px;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 14px;
+    }
+    th,
+    td {
+      text-align: left;
+      padding: 9px 0;
+      border-bottom: 1px solid var(--line);
+    }
+    th {
+      font-size: 12px;
+      font-weight: 500;
+      color: var(--sub);
+    }
+    td:last-child,
+    th:last-child {
+      text-align: right;
+    }
+    a {
+      color: var(--green);
+      text-underline-offset: 3px;
+    }
+    details {
+      margin: 12px 0;
+      font-size: 13px;
+    }
+    summary {
+      cursor: pointer;
+    }
+    footer {
+      padding: 15px 0 30px;
+      border-top: 1px solid var(--line);
+      font-size: 12px;
+      color: var(--sub);
+    }
+    ::selection {
+      background: #c3ddcb;
+    }
+    :focus-visible {
+      outline: 2px solid var(--green);
+      outline-offset: 4px;
+    }
+    @media (max-width: 720px) {
+      main,
+      header > div {
+        padding: 0 20px;
+      }
+      .lead {
+        padding: 25px 0 21px;
+      }
+      .stages {
+        gap: 15px;
+      }
+      .cols {
+        grid-template-columns: 1fr;
+        gap: 24px;
+      }
+      .cells {
+        grid-template-columns: repeat(25, minmax(0, 1fr));
+        gap: 2px;
+      }
+      .row {
+        flex-wrap: wrap;
+        gap: 0;
+      }
+      .lead {
+        grid-template-columns: 1fr;
+      }
+      .score {
+        text-align: left;
+        justify-self: start;
+        margin-top: 18px;
+      }
+      .num {
+        font-size: 37px;
+      }
+      .barlabel {
+        gap: 4px;
+        flex-wrap: wrap;
+      }
+      .stages h2 {
+        font-size: 14px;
+      }
+      header > div {
+        height: 52px;
+      }
+    }
+  </style>
+  <header>
+    <div>
+      <b class="brand">MemoryH</b
+      ><span id="live" class="status" role="status">连接中</span>
+    </div>
+  </header>
+  <main>
+    <div class="lead">
+      <div>
+        <div class="meta">实时评测 / 英文 cleaned 版</div>
+        <h1>LongMemEval-S</h1>
+        <p>500 题 · Top 5 完整会话 · GPT-4o 作答与判分</p>
+      </div>
+      <div class="score">
+        <p id="scorelabel">已判题准确率</p>
+        <div class="num" id="score">—</div>
+        <p id="fraction">等候首条判分</p>
+      </div>
+    </div>
+    <div class="stages" id="stages"></div>
+    <section>
+      <div class="row">
+        <h2>逐题进度</h2>
+        <small id="updated"></small>
+      </div>
+      <div class="legend">
+        <span><i></i>待检索</span><span><i class="work"></i>检索中</span
+        ><span><i class="rank"></i>已检索</span
+        ><span><i class="answer"></i>已作答</span
+        ><span><i class="yes"></i>判对</span
+        ><span><i class="no"></i>判错 / 出错</span>
+      </div>
+      <div
+        class="cells"
+        id="cells"
+        role="img"
+        aria-label="500 道题按数据集顺序展示"
+      ></div>
+      <p id="active"></p>
+    </section>
+    <section class="cols">
+      <div>
+        <h2>公开成绩参照</h2>
+        <small
+          >500 题端到端 QA，自报配置各异。核验于 2026-11-28（北京）。</small
+        >
+        <table>
+          <thead>
+            <tr>
+              <th>系统</th>
+              <th>作答配置</th>
+              <th>准确率</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><a href="https://recallium.ai/benchmarks">Recallium</a></td>
+              <td>Claude Opus 5.5</td>
+              <td>98.4%</td>
+            </tr>
+            <tr>
+              <td>
+                <a href="https://total-recall.dev/benchmarks">Total Recall</a>
+              </td>
+              <td>GPT-5.4，旧检索快照</td>
+              <td>98.0%</td>
+            </tr>
+            <tr>
+              <td>
+                <a href="https://www.contextstream.io/benchmarks"
+                  >ContextStream</a
+                >
+              </td>
+              <td>Claude Opus 5.5</td>
+              <td>96.8%</td>
+            </tr>
+          </tbody>
+        </table>
+        <details>
+          <summary>近期发布与评测口径</summary>
+          <p>
+            <a href="https://loom.clickhouse.com/docs/benchmarks/results"
+              >ClickHouse Loom</a
+            >
+            公布产品问答 96.6%，写入期间生成的答案 97.2%，固定 GPT-5 读 Top 200
+            为 92.0%。Recallium 同一组检索结果换成官方 GPT-4o 作答为 90.2%。<a
+              href="https://github.com/xiaowu0162/LongMemEval"
+              >LongMemEval-S 原作者</a
+            >发布数据与评分代码。上述为本次核验的公开配置，未收录的系统也可能有更高成绩。
+          </p>
+        </details>
+      </div>
+      <div>
+        <h2>本次与历史基线</h2>
+        <table>
+          <tbody>
+            <tr>
+              <th>历史 BGE · 500 题</th>
+              <td>421 / 500 · 84.2%</td>
+            </tr>
+            <tr>
+              <th>当前 QwenStore</th>
+              <td id="current">等待判分</td>
+            </tr>
+            <tr>
+              <th>Recall-All@5 · 已检索可答题</th>
+              <td id="recall">—</td>
+            </tr>
+            <tr>
+              <th>本次 API 费用估算</th>
+              <td id="cost">—</td>
+            </tr>
+          </tbody>
+        </table>
+        <p>
+          检索输入仅含用户发言。作答读取含双方发言的完整会话；提问日期和会话日期保留。
+        </p>
+      </div>
+    </section>
+    <footer>每 3 秒刷新 · 本机只读页面</footer>
+  </main>
+  <script>
+    const get = (id) => document.getElementById(id),
+      names = ["检索", "作答", "判分"];
+    const pct = (n) => (n * 100).toFixed(1) + "%";
+    const time = (s) =>
+      new Date(s).toLocaleTimeString("zh-CN", {
+        timeZone: "Asia/Shanghai",
+        hour12: false,
+      });
+    get("stages").innerHTML = names
+      .map(
+        (name, i) =>
+          '<div><div class="barlabel"><h2>' +
+          name +
+          '</h2><output id="n' +
+          i +
+          '">—</output></div><div class="track"><i id="b' +
+          i +
+          '"></i></div></div>',
+      )
+      .join("");
+    let dots = [];
+    function draw(d) {
+      const items = d.items,
+        rank = items.filter((x) => x.rank).length,
+        answered = items.filter((x) => x.answer).length,
+        judged = items.filter((x) => x.judge).length,
+        correct = items.filter((x) => x.correct).length;
+      const r = d.retrieval,
+        q = d.qa;
+      if (!dots.length) {
+        dots = items.map(() => {
+          const s = document.createElement("span");
+          get("cells").append(s);
+          return s;
+        });
+      }
+      items.forEach((x, i) => {
+        const state = x.error
+          ? "no"
+          : x.judge
+            ? x.correct
+              ? "yes"
+              : "no"
+            : x.answer
+              ? "answer"
+              : x.rank
+                ? "rank"
+                : r.active_question === i + 1
+                  ? "work"
+                  : "";
+        dots[i].className = state;
+        dots[i].title =
+          "#" +
+          (i + 1) +
+          " " +
+          (x.id || "") +
+          " " +
+          {
+            no: x.error ? "检索出错" : "判错",
+            yes: "判对",
+            answer: "已作答",
+            rank: "已检索",
+            work: "检索中",
+            "": "待检索",
+          }[state];
+      });
+      [rank, answered, judged].forEach((n, i) => {
+        get("n" + i).textContent = n + " / " + d.total;
+        get("b" + i).style.width = pct(n / d.total);
+      });
+      get("score").textContent = judged ? pct(correct / judged) : "—";
+      get("fraction").textContent = judged
+        ? "答对 " + correct + " / 已判 " + judged + " 题"
+        : "等候首条判分";
+      get("scorelabel").textContent =
+        judged === d.total ? "最终准确率" : "已判题准确率";
+      get("current").textContent = judged
+        ? correct + " / " + judged + " · " + pct(correct / judged)
+        : "等待判分";
+      get("recall").textContent = r.scored_retrieval_questions
+        ? pct(r.recall_all_at_5_so_far) +
+          "（" +
+          r.scored_retrieval_questions +
+          " 题）"
+        : "—";
+      get("cost").textContent =
+        q.cost_estimate_usd != null
+          ? "US$ " + q.cost_estimate_usd.toFixed(3)
+          : "—";
+      get("updated").textContent = "北京 " + time(d.time);
+      get("live").textContent =
+        judged === d.total
+          ? "评测完成"
+          : !d.retrieving && rank < d.total
+            ? "检索进程已停止"
+            : !d.grading && judged < d.total
+              ? q.pause_reason || "判分进程待启动或已停止"
+              : "实时同步";
+      let active = r.active_question
+        ? "正在检索第 " + r.active_question + " 题"
+        : "";
+      const m = /indexed (\d+)\/(\d+)/.exec(d.worker || "");
+      if (active && m)
+        active += " · 已写入 " + m[1] + " / " + m[2] + " 段有效会话";
+      else if (active) active += " · 正在召回或重排";
+      if (q.active_question)
+        active += "　作答 / 判分第 " + q.active_question + " 题";
+      const err = Object.keys(r.errors || {}).length;
+      get("active").textContent =
+        [active, err ? "检索出错 " + err + " 题" : ""]
+          .filter(Boolean)
+          .join(" · ") || "各阶段计数已更新";
+    }
+    async function update() {
+      try {
+        const res = await fetch("/status.json", { cache: "no-store" });
+        if (!res.ok) throw Error();
+        draw(await res.json());
+      } catch {
+        get("live").textContent = "连接中断，正在重试";
+      } finally {
+        setTimeout(update, 3000);
+      }
+    }
+    update();
+  </script>
+</html>

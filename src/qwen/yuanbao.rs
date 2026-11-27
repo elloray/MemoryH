@@ -1,4 +1,6 @@
 //! Pointwise Yuanbao decision scoring with its trained chat template.
+mod mps;
+
 use std::path::Path;
 
 use ort::{session::Session, value::Tensor};
@@ -12,9 +14,14 @@ const PREFIX: &str = "<|im_start|>system\nJudge whether the Document meets the r
 const SUFFIX: &str = "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n";
 const CONTEXT: usize = 512;
 
+enum Backend {
+    Cpu(Session),
+    Mps(mps::Mps),
+}
+
 pub(super) struct Yuanbao {
     tokenizer: Tokenizer,
-    session: Session,
+    backend: Backend,
     suffix: Vec<u32>,
     pad: i64,
     instruction: String,
@@ -49,10 +56,13 @@ impl Yuanbao {
                 ..Default::default()
             }))
             .map_err(inference_error)?;
-        let session = cpu_session(&dir.join("yuanbao.onnx"), runtime, threads)?;
+        let backend = match std::env::var_os("MEMORYH_YUANBAO_MPS_DIR") {
+            Some(path) => Backend::Mps(mps::Mps::open(Path::new(&path))?),
+            None => Backend::Cpu(cpu_session(&dir.join("yuanbao.onnx"), runtime, threads)?),
+        };
         Ok(Self {
             tokenizer,
-            session,
+            backend,
             suffix,
             pad: i64::from(pad),
             instruction: instruction.to_owned(),
@@ -82,17 +92,26 @@ impl Yuanbao {
                     mask[start + offset] = 1;
                 }
             }
-            let tensor = |v: Vec<i64>| Tensor::from_array((shape, v)).map_err(inference_error);
-            let out = self
-                .session
-                .run(ort::inputs!["input_ids" => tensor(ids)?, "attention_mask" => tensor(mask)?])
-                .map_err(inference_error)?;
-            let (dims, values) = out
-                .get("decision_logits")
-                .ok_or_else(|| inference_error("missing Yuanbao decision logits"))?
-                .try_extract_tensor::<f32>()
-                .map_err(inference_error)?;
-            if **dims != [batch.len() as i64, 2] || values.iter().any(|v| !v.is_finite()) {
+            let values = match &mut self.backend {
+                Backend::Cpu(session) => {
+                    let tensor =
+                        |v: Vec<i64>| Tensor::from_array((shape, v)).map_err(inference_error);
+                    let out = session
+                        .run(ort::inputs!["input_ids" => tensor(ids)?, "attention_mask" => tensor(mask)?])
+                        .map_err(inference_error)?;
+                    let (dims, logits) = out
+                        .get("decision_logits")
+                        .ok_or_else(|| inference_error("missing Yuanbao decision logits"))?
+                        .try_extract_tensor::<f32>()
+                        .map_err(inference_error)?;
+                    if **dims != [batch.len() as i64, 2] {
+                        return Err(inference_error("invalid Yuanbao output shape"));
+                    }
+                    logits.to_vec()
+                }
+                Backend::Mps(worker) => worker.logits(shape, &ids, &mask)?,
+            };
+            if values.iter().any(|v| !v.is_finite()) {
                 return Err(inference_error(
                     "expected finite [no, yes] logits per candidate",
                 ));

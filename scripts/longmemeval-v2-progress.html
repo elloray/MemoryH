@@ -1,0 +1,32 @@
+<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MemoryH · LongMemEval-V2 Small</title><link rel="stylesheet" href="/progress.css">
+<header><div><b class="brand">MemoryH</b><a href="/v1">查看已暂停的 S 版</a></div></header>
+<main>
+<div class="lead"><div><div class="meta">LongMemEval-V2 / Small</div><h1>记忆检索评测</h1><p id="reader"></p></div>
+<div class="score"><p>已判题准确率</p><div class="num" id="score">—</div><p id="fraction">等待首条判分</p></div></div>
+<section><div class="row"><h2 id="phase">正在读取进度</h2><small id="stamp"></small></div><p id="detail" role="status"></p></section>
+<section><h2>两组环境</h2><table><thead><tr><th>环境</th><th>轨迹入库</th><th>已检索</th><th>已作答</th><th>已判分</th></tr></thead><tbody id="domains"></tbody></table></section>
+<section><div class="row"><h2>Small 官方已验证提交</h2><a href="https://xiaowu0162.github.io/longmemeval-v2/#leaderboard">官方榜单 ↗</a></div>
+<table><thead><tr><th>系统</th><th>准确率</th><th>平均查询延迟</th><th>LAFS Gain</th></tr></thead><tbody id="leaders"></tbody></table><p>官方按 LAFS Gain 排名，论文基线单列。2026-11-28 核验时共有 3 个已验证提交。多配置系统展示准确率最高配置的延迟，Gain 使用全部配置。</p></section>
+<footer>本机进度每 3 秒刷新</footer></main>
+<script>
+const el=id=>document.getElementById(id);
+function table(id, rows) {
+ const body=el(id); body.replaceChildren(...rows.map(values=>{
+   const row=document.createElement('tr');for(const v of values){const cell=document.createElement('td');cell.textContent=v;row.append(cell)}return row
+ }));
+}
+async function refresh(){
+ try{
+ const response=await fetch('/v2-status.json',{cache:'no-store'});if(!response.ok)throw Error();
+ const d=await response.json();el('phase').textContent=d.phase;el('detail').textContent=d.detail;
+ el('stamp').textContent=new Date(d.time).toLocaleTimeString('zh-CN',{timeZone:'Asia/Shanghai'})+' 北京';
+ el('reader').textContent=d.reader+' · 295 题规则匹配，156 题由 GPT-5.2 判分';
+ let done=0,right=0;table('domains',d.domains.map(g=>{done+=g.judged;right+=g.correct;return [g.name,g.indexed+'/100',g.queries+'/'+g.total,g.answers+'/'+g.total,g.judged+'/'+g.total]}));
+ el('score').textContent=done?(100*right/done).toFixed(1)+'%':'—';el('fraction').textContent='答对 '+right+' / 已判 '+done+' / 总计 451';
+ const f=(v,n,s='')=>v==null?'—':v.toFixed(n)+s;
+ table('leaders',[...d.leaders,d.memoryh].map(s=>[s.name,f(s.accuracy,2,'%'),f(s.latency,2,' 秒'),f(s.gain,4)]));
+ }catch{el('phase').textContent='连接中断，正在重试'}finally{setTimeout(refresh,3000)}
+}
+refresh();
+</script></html>

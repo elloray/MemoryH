@@ -241,6 +241,21 @@ uv run --script longmemeval_qa.py --official-dir "$LME_DIR" \
 
 执行 API 问答时，移除 `--estimate`，传入 `--output` 和以美元计的 `--budget`，通过环境变量 `OPENAI_API_KEY` 或 `--key-file` 加载密钥。传入 `--reference "$LME_DIR/longmemeval_s_cleaned.json"` 可运行官方准确率汇总。复用同一个输出文件时，脚本核对提示词后跳过已完成的题。检索脚本的 `--reuse --generation-method` 可从逐题排名导出其他路线的作答输入。报告使用 Apple MPS，共用 BGE 的原版权重。
 
+### LoCoMo 英文评测与 M4 GPU 重排
+
+评测选取 LoCoMo 的 1,540 道英文题（类别 1–4），使用固定版本的 Mem0 作答与判分脚本。MemoryH 默认每路召回 32 条，GPT-5 每题最多接收 200 条原文。逐题记录实际作答输入 token、检索耗时与重排设备。进度页按相同题号对比 Mem0 公开的逐题结果。
+
+在 Apple Silicon 上，先准备 Yuanbao 的原生 Metal 打分进程与 FP16 权重。Rust 端沿用 CPU 路径的分词、补齐和排序逻辑，仅将 Yuanbao 打分交给 GPU。GPU 运行依赖准备时使用的 LibTorch 动态库。检索和判分命令可在两个终端独立运行，判分使用环境变量 `OPENAI_API_KEY`。
+
+```sh
+uv run scripts/prepare-yuanbao-mps.py target/yuanbao-mps
+uv run scripts/locomo-compare.py retrieve --reranker mps --recall-width 32
+uv run scripts/locomo-compare.py grade
+python3 scripts/longmemeval-progress.py --out target/lme-qwen-main --port 8765
+```
+
+本机进度页位于 `http://127.0.0.1:8765/`。CPU 对照可显式指定 `--reranker cpu`。检查点位于 `target/locomo-compare/`，续跑会复用已完成的题目。
+
 ## 实验方法
 
 - **FTS5** 将中文切成重叠双字，将字母数字串保留为整体。查询用同样的方式生成词项，由 SQLite BM25 排序。同一个查询文本的 FTS5 候选由扁平与树路线共用。[SQLite FTS5](https://sqlite.org/fts5.html)
