@@ -136,6 +136,29 @@ impl SharedStore {
         self.read(|store| store.retrieve(queries, options, method))
     }
 
+    #[cfg(feature = "qwen")]
+    pub(crate) fn recall(
+        &self,
+        queries: &[Query<'_>],
+        limit: usize,
+        scann: &Arc<crate::retrieval::scann::ScannLibrary>,
+    ) -> Result<(Vec<Record>, std::time::Duration)> {
+        let snapshot = self.read(|store| Ok(Arc::clone(&store.index.retrieval)))?;
+        let (ids, vector_time) = snapshot.candidates(queries, limit, scann)?;
+        drop(snapshot);
+        // Record IDs are immutable and remain readable even across a correction.
+        self.read(|store| {
+            ids.iter()
+                .map(|id| {
+                    store
+                        .get_by_id(id)?
+                        .ok_or_else(|| Error::Corrupt(format!("missing recalled record {id}")))
+                })
+                .collect::<Result<Vec<_>>>()
+                .map(|records| (records, vector_time))
+        })
+    }
+
     pub fn data_syncs(&self) -> Result<u64> {
         self.read(|store| Ok(store.data_syncs()))
     }

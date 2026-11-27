@@ -6,7 +6,11 @@ pub mod bge;
 mod cache;
 mod format;
 mod group;
+#[cfg(any(feature = "bge", feature = "qwen"))]
+mod inference;
 mod log;
+#[cfg(feature = "qwen")]
+pub mod qwen;
 pub use group::SharedStore;
 #[cfg(feature = "python")]
 mod python;
@@ -14,6 +18,7 @@ mod retrieval;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
+use std::sync::Arc;
 
 pub use cache::CacheStats;
 use cache::{BLOCK_SIZE, BlockCache, Cache};
@@ -37,8 +42,8 @@ pub enum Error {
     Conflict(String),
     #[error("invalid search query: {0}")]
     InvalidQuery(String),
-    #[cfg(feature = "bge")]
-    #[error("BGE inference error: {0}")]
+    #[cfg(feature = "inference")]
+    #[error("local inference error: {0}")]
     Embedding(String),
     #[error("corrupt memory store: {0}")]
     Corrupt(String),
@@ -234,7 +239,7 @@ impl Store {
         options: &SearchOptions,
     ) -> Result<SearchResult> {
         self.ensure_available()?;
-        self.index.retrieval.search(queries, options)
+        Arc::make_mut(&mut self.index.retrieval).search(queries, options)
     }
 
     /// Return the original records for one search method, up to `top_k`.
@@ -296,6 +301,49 @@ impl Store {
         Ok(self.index.versions.get(key).map_or(&[], Vec::as_slice))
     }
 
+    /// Visit each committed batch in journal order, including corrections and retractions.
+    /// This exports original mutations without carrying over model-specific vectors.
+    pub fn visit_mutations(
+        &self,
+        mut visit: impl FnMut(u64, &[Mutation]) -> Result<()>,
+    ) -> Result<()> {
+        self.ensure_available()?;
+        self.log.visit_committed(|payload| {
+            let (revision, entries) = decode_batch(payload)?;
+            let batch: Vec<_> = entries
+                .into_iter()
+                .map(|entry| match entry.operation {
+                    Operation::Write {
+                        id,
+                        key,
+                        body,
+                        source,
+                        supersedes,
+                    } => {
+                        let memory = Memory {
+                            id: id.into(),
+                            key: key.into(),
+                            source: source.into(),
+                            body: body.into(),
+                        };
+                        match supersedes {
+                            Some(id) => Mutation::Replace {
+                                expected_id: id.into(),
+                                memory,
+                            },
+                            None => Mutation::Put(memory),
+                        }
+                    }
+                    Operation::Retract { key, expected_id } => Mutation::Retract {
+                        key: key.into(),
+                        expected_id: expected_id.into(),
+                    },
+                })
+                .collect();
+            visit(revision, &batch)
+        })
+    }
+
     /// Enumerate visible keys and their record IDs for a retrieval index.
     pub fn visible_keys(&self, revision: u64) -> Result<impl Iterator<Item = (&str, &str)>> {
         self.ensure_available()?;
@@ -341,7 +389,7 @@ struct Index {
     revision: u64,
     versions: BTreeMap<String, Vec<Version>>,
     by_id: HashMap<String, RecordLocation>,
-    retrieval: RetrievalIndex,
+    retrieval: Arc<RetrievalIndex>,
 }
 
 impl Index {
@@ -419,9 +467,9 @@ impl Index {
                     ..
                 } => {
                     if let Some(old) = supersedes {
-                        self.retrieval.remove(old);
+                        Arc::make_mut(&mut self.retrieval).remove(old);
                     }
-                    self.retrieval.insert(
+                    Arc::make_mut(&mut self.retrieval).insert(
                         id,
                         key,
                         body,
@@ -441,7 +489,7 @@ impl Index {
                     Some(id.to_owned())
                 }
                 Operation::Retract { expected_id, .. } => {
-                    self.retrieval.remove(expected_id);
+                    Arc::make_mut(&mut self.retrieval).remove(expected_id);
                     None
                 }
             };

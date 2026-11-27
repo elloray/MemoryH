@@ -558,3 +558,40 @@ fn competing_shared_corrections_publish_only_the_acknowledged_winner() {
     assert_eq!(reopened.get("milk").unwrap().unwrap().memory, winner);
     assert_eq!(reopened.get_at("milk", 1).unwrap().unwrap().memory.id, "v1");
 }
+
+#[test]
+fn replay_exports_original_mutations_in_commit_order_across_segments() {
+    let dir = tempdir().unwrap();
+    let options = Options {
+        segment_bytes: 64,
+        ..Options::default()
+    };
+    let mut source = Store::open(dir.path(), options).unwrap();
+    let first = vec![
+        Mutation::Put(memory("z1", "z", "第一条")),
+        Mutation::Put(memory("a1", "a", "第二条")),
+    ];
+    let second = vec![
+        Mutation::Replace {
+            expected_id: "z1".into(),
+            memory: memory("z2", "z", "更正"),
+        },
+        Mutation::Retract {
+            key: "z".into(),
+            expected_id: "z2".into(),
+        },
+        Mutation::Put(memory("z3", "z", "恢复")),
+    ];
+    source
+        .apply_with_embeddings(&first, &[Some(&[1.0]), Some(&[1.0])])
+        .unwrap();
+    source.apply(&second).unwrap();
+    let mut restored = Vec::new();
+    source
+        .visit_mutations(|revision, batch| {
+            restored.push((revision, batch.to_vec()));
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(restored, [(1, first), (2, second)]);
+}
