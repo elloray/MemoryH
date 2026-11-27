@@ -177,7 +177,6 @@ impl RetrievalIndex {
     pub(crate) fn candidates(
         &self,
         queries: &[Query<'_>],
-        limit: usize,
         lib: &Arc<ScannLibrary>,
     ) -> Result<(Vec<String>, std::time::Duration)> {
         use std::collections::BTreeSet;
@@ -207,11 +206,11 @@ impl RetrievalIndex {
                     ));
                 }
                 let (words, semantic) = rayon::join(
-                    || self.lexical(query.text, limit),
+                    || self.lexical(query.text, lib.options.keyword_limit),
                     || {
                         let start = Instant::now();
                         let hits = match searcher {
-                            Some(index) => index.search(vector, limit),
+                            Some(index) => index.search(vector, lib.options.vector_limit),
                             None => Ok(vec![]),
                         };
                         (hits, start.elapsed())
@@ -668,8 +667,50 @@ mod candidate_tests {
 
     #[test]
     #[ignore = "requires the native ScaNN shared library"]
+    fn configurable_recall_exceeds_nine_and_exact_and_all_probes_match() {
+        for (count, exact_threshold, probes, limit) in [(64, 64, None, 32), (65, 64, Some(100), 37)]
+        {
+            let lib = ScannLibrary::load(
+                &ScannLibrary::default_path(),
+                scann::RecallOptions {
+                    vector_limit: limit,
+                    keyword_limit: 1,
+                    exact_threshold,
+                    partitions_to_search: probes,
+                },
+            )
+            .unwrap();
+            let mut index = RetrievalIndex::default();
+            for n in 0..count {
+                let angle = n as f32 * 0.02;
+                let id = format!("v{n:02}");
+                index.insert(&id, &id, "", Some(vec![angle.cos(), angle.sin()]));
+            }
+            let query = Query {
+                text: "",
+                embedding: Some(&[1., 0.]),
+            };
+            let (ids, _) = index.candidates(&[query], &lib).unwrap();
+            assert_eq!(
+                ids,
+                (0..limit).map(|n| format!("v{n:02}")).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "requires the native ScaNN shared library"]
     fn scann_rebuilds_after_corrections_without_changing_old_snapshots() {
-        let lib = ScannLibrary::load(&ScannLibrary::default_path()).unwrap();
+        let lib = ScannLibrary::load(
+            &ScannLibrary::default_path(),
+            scann::RecallOptions {
+                vector_limit: 1,
+                keyword_limit: 1,
+                exact_threshold: 0,
+                ..Default::default()
+            },
+        )
+        .unwrap();
         let mut index = RetrievalIndex::default();
         for n in 0..28 {
             let angle = n as f32 * 0.2;
@@ -683,7 +724,6 @@ mod candidate_tests {
                         text: "",
                         embedding: Some(&[1., 0.]),
                     }],
-                    1,
                     &lib,
                 )
                 .unwrap()
@@ -700,7 +740,16 @@ mod candidate_tests {
     #[test]
     #[ignore = "requires the native ScaNN shared library"]
     fn union_retains_single_channel_hits_and_deduplicates_across_clauses() {
-        let lib = ScannLibrary::load(&ScannLibrary::default_path()).unwrap();
+        let lib = ScannLibrary::load(
+            &ScannLibrary::default_path(),
+            scann::RecallOptions {
+                vector_limit: 1,
+                keyword_limit: 1,
+                exact_threshold: 0,
+                ..Default::default()
+            },
+        )
+        .unwrap();
         let mut index = RetrievalIndex::default();
         index.insert("lex", "k1", "预订编号 NJ042", Some(vec![0., 1.]));
         index.insert("vec", "k2", "其他内容", Some(vec![1., 0.]));
@@ -709,15 +758,12 @@ mod candidate_tests {
             embedding: Some(&[1., 0.]),
         };
         assert_eq!(
-            index.candidates(&[query(), query()], 1, &lib).unwrap().0,
+            index.candidates(&[query(), query()], &lib).unwrap().0,
             ["lex", "vec"]
         );
         let old = index.clone();
         index.remove("vec");
-        assert_eq!(index.candidates(&[query()], 1, &lib).unwrap().0, ["lex"]);
-        assert_eq!(
-            old.candidates(&[query()], 1, &lib).unwrap().0,
-            ["lex", "vec"]
-        );
+        assert_eq!(index.candidates(&[query()], &lib).unwrap().0, ["lex"]);
+        assert_eq!(old.candidates(&[query()], &lib).unwrap().0, ["lex", "vec"]);
     }
 }

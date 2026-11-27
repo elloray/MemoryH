@@ -18,19 +18,21 @@ void error_message(char* out, size_t capacity, const std::string& message) {
 }  // namespace
 
 // Fixed ABI: row-major, unit-normalized float32 vectors; callers own the output buffers.
-extern "C" __attribute__((visibility("default"))) void* memoryh_scann_build_v1(
-    const float* rows, uint32_t count, uint32_t dim, char* error,
-    size_t capacity) noexcept {
+extern "C" __attribute__((visibility("default"))) void* memoryh_scann_build_v2(
+    const float* rows, uint32_t count, uint32_t dim, uint32_t limit,
+    uint32_t exact_threshold, uint32_t probes, char* error, size_t capacity) noexcept {
   try {
-    const int k = std::min<uint32_t>(9, count);
+    const int k = std::min(limit, count);
     scann_core::ConfigBuilder builder(k, scann_core::DistanceMeasure::kDotProduct, dim);
-    scann_core::TreeOptions tree;
-    tree.num_leaves = count == 1 ? 1 : std::max(2, static_cast<int>(std::sqrt(count)));
-    // For small stores all nine requested candidates may span every partition.
-    tree.num_leaves_to_search = count < 18 ? tree.num_leaves : (tree.num_leaves + 1) / 2;
-    tree.min_partition_size = 1;
-    tree.random_init = false;
-    builder.Tree(tree);
+    if (count > exact_threshold && count > 1) {
+      scann_core::TreeOptions tree;
+      tree.num_leaves = std::max(2, static_cast<int>(std::sqrt(count)));
+      tree.num_leaves_to_search = probes ? std::min<uint32_t>(probes, tree.num_leaves)
+                                        : (tree.num_leaves + 1) / 2;
+      tree.min_partition_size = 1;
+      tree.random_init = false;
+      builder.Tree(tree);
+    }
     auto config = builder.ScoreBruteForce().BuildText(count);
     if (!config.ok()) {
       error_message(error, capacity, config.status().ToString());

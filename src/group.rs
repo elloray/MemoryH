@@ -140,11 +140,10 @@ impl SharedStore {
     pub(crate) fn recall(
         &self,
         queries: &[Query<'_>],
-        limit: usize,
         scann: &Arc<crate::retrieval::scann::ScannLibrary>,
     ) -> Result<(Vec<Record>, std::time::Duration)> {
         let snapshot = self.read(|store| Ok(Arc::clone(&store.index.retrieval)))?;
-        let (ids, vector_time) = snapshot.candidates(queries, limit, scann)?;
+        let (ids, vector_time) = snapshot.candidates(queries, scann)?;
         drop(snapshot);
         // Record IDs are immutable and remain readable even across a correction.
         self.read(|store| {

@@ -32,7 +32,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         rounds,
         load_ns,
         |m| store.apply(m),
-        |q| store.retrieve(q),
+        |q| store.retrieve_top_k(q, 3),
         |q| store.retrieve_top_k(q, usize::MAX),
     )?;
     let fixture: common::Fixture<text_benchmark::Question> =

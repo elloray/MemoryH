@@ -4,8 +4,8 @@ use std::path::Path;
 use ort::{session::Session, value::Tensor};
 use tokenizers::{PaddingParams, Tokenizer, TruncationParams};
 
+use crate::Result;
 use crate::inference::{cpu_session, inference_error};
-use crate::{Record, Result};
 
 pub struct CrossEncoder {
     tokenizer: Tokenizer,
@@ -46,13 +46,10 @@ impl CrossEncoder {
         })
     }
 
-    pub(super) fn score(&mut self, query: &str, records: &[Record]) -> Result<Vec<f32>> {
-        let mut scores = Vec::with_capacity(records.len());
-        for batch in records.chunks(16) {
-            let pairs: Vec<_> = batch
-                .iter()
-                .map(|r| (query, r.memory.body.as_str()))
-                .collect();
+    pub(super) fn score(&mut self, query: &str, documents: &[String]) -> Result<Vec<f32>> {
+        let mut scores = Vec::with_capacity(documents.len());
+        for batch in documents.chunks(16) {
+            let pairs: Vec<_> = batch.iter().map(|r| (query, r.as_str())).collect();
             let enc = self
                 .tokenizer
                 .encode_batch(pairs, true)
