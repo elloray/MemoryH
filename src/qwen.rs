@@ -1,5 +1,10 @@
 //! Local Qwen semantic recall, independent keyword recall and cross-encoder reranking.
 mod encoder;
+mod evidence;
+pub use evidence::{Date, QueryContext, session_date};
+pub use splitter::QueryIntent;
+use std::collections::{BTreeMap, BTreeSet};
+
 mod rerank;
 mod splitter;
 use crate::retrieval::scann::ScannLibrary;
@@ -23,15 +28,15 @@ enum Reranker {
 }
 
 impl Reranker {
-    fn score(&mut self, question: &str, records: &[Record]) -> Result<Vec<f32>> {
+    fn score(&mut self, question: &str, documents: &[String]) -> Result<Vec<f32>> {
         match self {
-            Self::MiniLm(model) => model.score(question, records),
-            Self::Yuanbao(model) => model.score(question, records),
+            Self::MiniLm(model) => model.score(question, documents),
+            Self::Yuanbao(model) => model.score(question, documents),
         }
     }
 }
 
-const CHANNEL_LIMIT: usize = 9;
+pub use crate::retrieval::scann::RecallOptions;
 const TOP_K: usize = 3;
 const MODEL_MARKER: &str = "QWEN3_EMBEDDING_06B_INT8_V1";
 
@@ -42,9 +47,15 @@ pub struct QwenModels {
     reranker: Arc<Mutex<Reranker>>,
     splitter: splitter::Splitter,
     scann_library: PathBuf,
+    recall: RecallOptions,
 }
 
 impl QwenModels {
+    pub fn with_recall_options(mut self, options: RecallOptions) -> Self {
+        self.recall = options;
+        self
+    }
+
     /// Override the local Qwen3.5-2B endpoint for this set of models.
     pub fn with_splitter(mut self, address: std::net::SocketAddr) -> Result<Self> {
         self.splitter = splitter::Splitter::new(address)?;
@@ -101,6 +112,7 @@ impl QwenModels {
             reranker: Arc::new(Mutex::new(ranker)),
             splitter,
             scann_library: ScannLibrary::default_path(),
+            recall: RecallOptions::default(),
         })
     }
 }
@@ -110,6 +122,9 @@ pub struct SearchProfile {
     pub records: Vec<Record>,
     pub variants: Vec<String>,
     pub candidate_count: usize,
+    pub intent: QueryIntent,
+    /// Evidence identities extracted for inventory selection, keyed by candidate ID.
+    pub inventory_facts: BTreeMap<String, BTreeSet<String>>,
     pub split: Duration,
     pub encode: Duration,
     pub recall: Duration,
@@ -128,7 +143,7 @@ pub struct QwenStore {
 impl QwenStore {
     pub fn open(path: impl AsRef<Path>, options: Options, models: QwenModels) -> Result<Self> {
         let path = path.as_ref();
-        let scann = ScannLibrary::load(&models.scann_library)?;
+        let scann = ScannLibrary::load(&models.scann_library, models.recall)?;
         let store = Store::open(path, options)?;
         bind_model(path, &store)?;
         Ok(Self {
@@ -144,9 +159,9 @@ impl QwenStore {
         })
     }
 
-    /// Rank every unique active candidate once against the original question.
+    /// Inventory queries return up to five originals. Other intents default to three.
     pub fn retrieve(&self, question: &str) -> Result<Vec<Record>> {
-        self.retrieve_top_k(question, TOP_K)
+        self.retrieve_with_context(question, &QueryContext::default())
     }
 
     /// Return up to k reranked originals from the same deduplicated candidate pool.
@@ -155,11 +170,47 @@ impl QwenStore {
     }
 
     pub fn retrieve_profiled(&self, question: &str, k: usize) -> Result<SearchProfile> {
-        if k == 0 || question.trim().is_empty() {
+        self.retrieve_profiled_with_context(question, Some(k), &QueryContext::default())
+    }
+
+    pub fn retrieve_with_context(
+        &self,
+        question: &str,
+        context: &QueryContext,
+    ) -> Result<Vec<Record>> {
+        Ok(self
+            .retrieve_profiled_with_context(question, None, context)?
+            .records)
+    }
+
+    pub fn retrieve_profiled_with_context(
+        &self,
+        question: &str,
+        k: Option<usize>,
+        context: &QueryContext,
+    ) -> Result<SearchProfile> {
+        if k == Some(0) || question.trim().is_empty() {
             return Ok(SearchProfile::default());
         }
         let start = Instant::now();
-        let variants = self.models.splitter.variants(question)?;
+        let plan = self.models.splitter.plan(question)?;
+        let mut variants = plan.variants;
+        if plan.intent == QueryIntent::Recommendation {
+            let angle = if question
+                .chars()
+                .any(|c| ('\u{3400}'..='\u{9fff}').contains(&c))
+            {
+                "用户已经拥有的设备、习惯或偏好，哪些能让这个建议更有针对性？"
+            } else {
+                "Which devices, habits or preferences the user already has would make this advice more useful?"
+            };
+            variants.insert(1, format!("{question}\n{angle}"));
+        }
+        let k = k.unwrap_or(if plan.intent == QueryIntent::Inventory {
+            5
+        } else {
+            TOP_K
+        });
         let split = start.elapsed();
         let start = Instant::now();
         let texts: Vec<_> = variants.iter().map(String::as_str).collect();
@@ -174,25 +225,55 @@ impl QwenStore {
                 embedding: Some(vector),
             })
             .collect();
-        let (records, vector) = self.store.recall(&queries, CHANNEL_LIMIT, &self.scann)?;
+        let (records, vector) = self.store.recall(&queries, &self.scann)?;
         let recall = start.elapsed();
         let candidate_count = records.len();
         let start = Instant::now();
-        let scores = self
-            .models
-            .reranker
-            .lock()
-            .unwrap()
-            .score(question, &records)?;
-        let mut hits: Vec<_> = records.into_iter().zip(scores).collect();
-        hits.sort_unstable_by(|(a, sa), (b, sb)| {
-            sb.total_cmp(sa).then_with(|| a.memory.id.cmp(&b.memory.id))
-        });
-        let records = hits.into_iter().take(k).map(|(r, _)| r).collect();
+        let documents: Vec<_> = records
+            .iter()
+            .map(|record| context.document(record))
+            .collect();
+        let mut order = {
+            let mut ranker = self.models.reranker.lock().unwrap();
+            let direct = ranker.score(&context.query(question), &documents)?;
+            let aspects = variants[1..]
+                .iter()
+                .map(|aspect| ranker.score(&context.query(aspect), &documents))
+                .collect::<Result<Vec<_>>>()?;
+            evidence::evidence_order(&direct, &aspects)
+        };
+        let mut inventory_facts = BTreeMap::new();
+        if plan.intent == QueryIntent::Inventory {
+            let asked = context.query(question);
+            let mut known = Vec::new();
+            let mut facts = vec![BTreeSet::new(); records.len()];
+            for &i in &order {
+                let record = &records[i].memory;
+                let header = documents[i].strip_suffix(&record.body).unwrap_or_default();
+                facts[i] = self.models.splitter.facts(
+                    &asked,
+                    &record.body,
+                    header,
+                    context.date_of(&records[i]),
+                    &mut known,
+                )?;
+                inventory_facts.insert(record.id.clone(), facts[i].clone());
+            }
+            order = evidence::cover_facts(order, &facts, 5);
+        }
+        // Move the selected originals without cloning potentially long session bodies.
+        let mut records: Vec<_> = records.into_iter().map(Some).collect();
+        let records = order
+            .into_iter()
+            .take(k)
+            .map(|i| records[i].take().unwrap())
+            .collect();
         Ok(SearchProfile {
             records,
             variants,
             candidate_count,
+            intent: plan.intent,
+            inventory_facts,
             split,
             encode,
             recall,

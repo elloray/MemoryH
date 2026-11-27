@@ -1,0 +1,174 @@
+{
+  "memories": [
+    {
+      "id": "walk",
+      "key": "walk",
+      "source": "2025/06/10 (Tue) 12:30",
+      "text": "今天去了湖滨公园散步，拍了一张湖景。"
+    },
+    {
+      "id": "walk2",
+      "key": "walk2",
+      "source": "2025-06-15",
+      "text": "今天去了西山公园散步，拍了一张山景。"
+    },
+    {
+      "id": "me",
+      "key": "me",
+      "source": "工作笔记",
+      "text": "我入职时是 32 岁，今年刚满 38 岁。"
+    },
+    {
+      "id": "dept",
+      "key": "dept",
+      "source": "季度人事报表",
+      "text": "本季度我们部门的平均年龄是 31 岁。"
+    },
+    {
+      "id": "old",
+      "key": "old",
+      "source": "公司介绍",
+      "text": "全公司的平均年龄是 35 岁，新人培训不分部门。"
+    },
+    {
+      "id": "battery",
+      "key": "battery",
+      "source": "出发前整理",
+      "text": "我包里一直放着一块两万毫安时的移动电源，带 USB-C 输出。"
+    },
+    {
+      "id": "trip",
+      "key": "trip",
+      "source": "行程单",
+      "text": "周末徒步线路全程没有插座，我用手机导航。"
+    },
+    {
+      "id": "table",
+      "key": "table",
+      "source": "搬家日记",
+      "text": "搬进新家后，我买了一张橡木茶几，放在客厅。"
+    },
+    {
+      "id": "table2",
+      "key": "table2",
+      "source": "搬家日记二",
+      "text": "客厅那张新买的橡木茶几今天送货了。"
+    },
+    {
+      "id": "table3",
+      "key": "table3",
+      "source": "复盘",
+      "text": "我给搬家时买的那张客厅茶几上了木蜡油。"
+    },
+    {
+      "id": "bed",
+      "key": "bed",
+      "source": "家居备忘",
+      "text": "新家的卧室缺床垫，我后来买了乳胶床垫。"
+    },
+    {
+      "id": "shelf",
+      "key": "shelf",
+      "source": "书房备忘",
+      "text": "搬进新家后我买了书架，装在书房窗边。"
+    },
+    {
+      "id": "chair",
+      "key": "chair",
+      "source": "收据",
+      "text": "搬新家时买了一把人体工学椅，用于书房办公。"
+    },
+    {
+      "id": "cabinet",
+      "key": "cabinet",
+      "source": "厨房记录",
+      "text": "搬进新家后，我买了餐边柜来收拾杯子。"
+    },
+    {
+      "id": "not-bought",
+      "key": "not-bought",
+      "source": "愿望清单",
+      "text": "我打算为新家买一张餐桌，尚未下单。"
+    }
+  ],
+  "corrections": [],
+  "questions": [
+    {
+      "id": "T",
+      "text": "十天前我去了哪个公园散步？",
+      "group": "时间",
+      "expected": [
+        "walk"
+      ],
+      "stage": "before",
+      "question_date": "2025-06-20"
+    },
+    {
+      "id": "T2",
+      "text": "十天前我去了哪个公园散步？",
+      "group": "时间",
+      "expected": [
+        "walk2"
+      ],
+      "stage": "before",
+      "question_date": "2025-06-25"
+    },
+    {
+      "id": "M",
+      "text": "我比部门平均年龄大多少岁？",
+      "group": "跨分支",
+      "expected": [
+        "me",
+        "dept"
+      ],
+      "stage": "before"
+    },
+    {
+      "id": "P",
+      "text": "周末徒步需要用手机导航，你能结合我的情况给我一些续航建议吗？",
+      "group": "个性化",
+      "expected": [
+        "battery",
+        "trip"
+      ],
+      "stage": "before"
+    },
+    {
+      "id": "I",
+      "text": "我搬进新家后已经买了哪些不同的家具？请帮我清点一下。",
+      "group": "清点",
+      "expected": [
+        "table",
+        "bed",
+        "shelf",
+        "chair",
+        "cabinet"
+      ],
+      "stage": "before",
+      "expected_groups": [
+        [
+          "table",
+          "table2",
+          "table3"
+        ],
+        [
+          "bed"
+        ],
+        [
+          "shelf"
+        ],
+        [
+          "chair"
+        ],
+        [
+          "cabinet"
+        ]
+      ],
+      "check_fact_groups": true,
+      "excluded_facts": [
+        "battery",
+        "not-bought"
+      ]
+    }
+  ]
+}

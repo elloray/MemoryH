@@ -10,7 +10,7 @@ crate-type = ["rlib", "cdylib"]
 
 [features]
 bge = ["inference"]
-qwen = ["inference", "dep:rayon", "dep:ureq", "dep:serde_json", "dep:libloading"]
+qwen = ["inference", "dep:rayon", "dep:ureq", "dep:serde_json", "dep:libloading", "dep:time"]
 inference = ["dep:ort", "dep:tokenizers"]
 python = ["dep:pyo3"]
 
@@ -26,6 +26,7 @@ jieba-rs = "0.8.1"
 rayon = { version = "1.11", optional = true }
 ureq = { version = "3.1.4", default-features = false, features = ["json"], optional = true }
 serde_json = { version = "1", optional = true }
+time = { version = "0.3", optional = true }
 libloading = { version = "0.9", optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]

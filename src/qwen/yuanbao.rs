@@ -4,8 +4,8 @@ use std::path::Path;
 use ort::{session::Session, value::Tensor};
 use tokenizers::{Tokenizer, TruncationParams};
 
+use crate::Result;
 use crate::inference::{cpu_session, inference_error};
-use crate::{Record, Result};
 
 pub const MEMORY_INSTRUCTION: &str = "判断这条记忆原文能否为问题提供直接证据。若问题有多个独立子问题，能回答其中任意一个就算相关。核对所问对象、条件和具体事实；仅仅话题相近不足以判为相关。";
 const PREFIX: &str = "<|im_start|>system\nJudge whether the Document meets the requirements based on the Query and the Instruct provided. Note that the answer can only be \"yes\" or \"no\".<|im_end|>\n<|im_start|>user\n";
@@ -59,17 +59,14 @@ impl Yuanbao {
         })
     }
 
-    pub(super) fn score(&mut self, query: &str, records: &[Record]) -> Result<Vec<f32>> {
-        let mut scores = Vec::with_capacity(records.len());
+    pub(super) fn score(&mut self, query: &str, documents: &[String]) -> Result<Vec<f32>> {
+        let mut scores = Vec::with_capacity(documents.len());
         let prefix = format!(
             "{PREFIX}<Instruct>: {}\n\n<Query>: {query}\n\n<Document>: ",
             self.instruction
         );
-        for batch in records.chunks(8) {
-            let bodies: Vec<_> = batch
-                .iter()
-                .map(|r| format!("{prefix}{}", r.memory.body))
-                .collect();
+        for batch in documents.chunks(8) {
+            let bodies: Vec<_> = batch.iter().map(|r| format!("{prefix}{r}")).collect();
             let enc = self
                 .tokenizer
                 .encode_batch(bodies, false)
@@ -110,7 +107,6 @@ impl Yuanbao {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Memory;
     use std::{env, path::PathBuf};
 
     #[test]
@@ -121,16 +117,7 @@ mod tests {
         let mut model =
             Yuanbao::load(&dir, &runtime, 2, "为问题寻找能直接回答的记忆原文。").unwrap();
         let records =
-            ["海边讲座在二层。", "观众可以从南门入场，现场供应饮用水。"].map(|body| Record {
-                memory: Memory {
-                    id: body.into(),
-                    key: body.into(),
-                    source: "fixture".into(),
-                    body: body.into(),
-                },
-                revision: 1,
-                supersedes: None,
-            });
+            ["海边讲座在二层。", "观众可以从南门入场，现场供应饮用水。"].map(String::from);
         // Independent official Transformers forward with right padding and the same task instruction.
         let reference = [11.546875_f32, -4.390625];
         let scores = model.score("海边讲座在哪一层？", &records).unwrap();

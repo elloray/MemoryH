@@ -1,0 +1,85 @@
+{
+  "memories": [
+    {
+      "id": "run-a",
+      "key": "run-a",
+      "source": "2025-06-01",
+      "text": "今天早上我参加了滨江公园的五公里跑步活动。"
+    },
+    {
+      "id": "run-a-recap",
+      "key": "run-a-recap",
+      "source": "2025-06-02",
+      "text": "昨天早上的滨江公园五公里跑步活动我参加了，拿到的完赛牌是绿色的。"
+    },
+    {
+      "id": "run-b",
+      "key": "run-b",
+      "source": "2025-06-08",
+      "text": "今天早上我又参加了一次滨江公园五公里跑步活动，这次跑得更快。"
+    },
+    {
+      "id": "run-c",
+      "key": "run-c",
+      "source": "2025-06-12",
+      "text": "今天晚上我在体育场参加了十公里接力跑。"
+    },
+    {
+      "id": "run-d",
+      "key": "run-d",
+      "source": "2025-06-15",
+      "text": "我今天参加了学校组织的校园定向跑比赛。"
+    },
+    {
+      "id": "run-e",
+      "key": "run-e",
+      "source": "2025-06-18",
+      "text": "今天我参加了南山的越野跑活动。"
+    },
+    {
+      "id": "plan",
+      "key": "plan",
+      "source": "2025-06-19",
+      "text": "我想参加下周的城市半程马拉松，还没有报名。"
+    }
+  ],
+  "corrections": [],
+  "questions": [
+    {
+      "id": "E",
+      "text": "请清点我在六月已经参加了哪些跑步活动，每次活动分别列出。",
+      "group": "清点",
+      "stage": "before",
+      "question_date": "2025-06-20",
+      "expected": [
+        "run-a",
+        "run-b",
+        "run-c",
+        "run-d",
+        "run-e"
+      ],
+      "expected_groups": [
+        [
+          "run-a",
+          "run-a-recap"
+        ],
+        [
+          "run-b"
+        ],
+        [
+          "run-c"
+        ],
+        [
+          "run-d"
+        ],
+        [
+          "run-e"
+        ]
+      ],
+      "check_fact_groups": true,
+      "excluded_facts": [
+        "plan"
+      ]
+    }
+  ]
+}

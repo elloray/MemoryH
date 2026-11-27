@@ -16,7 +16,7 @@ python3 scripts/benchmark-scann.py
 
 脚本通过 `QwenModels::load` 和 `QwenStore` 运行全部 21 道题，每题预热后默认计时 10 次。`--rounds 1` 可进行短测。每次运行在 `target/scann-eval/runs/` 下新建结果目录，包含 `report.md`、`summary.json`、逐题候选和计时数据 `queries.json`。可用 `--models-dir` 指向已有模型目录，或用 `--output-dir` 指定新的结果目录。[历史四组对照](scann-results.md)
 
-`QwenStore` 的查询固定使用本地 Qwen3.5-2B 拆题及原生 ScaNN。整题始终参与召回，模型返回至少两个不同子问题时也编码这些子问题。ScaNN 按有效版本快照建分区索引，更正后下次查询按需重建。28 条活跃记忆时建 5 个 k-means 分区、搜索 3 个；少于 18 条时搜索所有分区以保留小库候选。入选分区内用 float32 内积取邻居。[Qwen 官方模型](https://huggingface.co/Qwen/Qwen3.5-2B) · [ScaNN 上游](https://github.com/google-research/google-research/tree/master/scann)
+默认每个检索角度分别取最多 32 条向量候选和 32 条 BM25 候选，再按有效记录 ID 去重。向量索引由原生 ScaNN 构建，最多 64 条活跃向量时直接精确打分，超过阈值时用 k-means 分区，默认搜索半数分区（向上取整）。更新后按有效版本重新建索引。用 `QwenModels::with_recall_options(RecallOptions { vector_limit, keyword_limit, exact_threshold, partitions_to_search })` 配置。分区数超过实际叶子数时搜索全部分区。已有安装需要重新运行 `scripts/build-scann.sh` 构建新版桥接库，一键复测脚本会自动处理。[ScaNN 上游](https://github.com/google-research/google-research/tree/master/scann)
 
 测试脚本自动启停本地 llama.cpp 服务。应用集成时，查询默认连接 `127.0.0.1:8080` 的拆题服务。打开 `QwenStore` 时从当前目录的 `target/scann-eval/deps/build/` 加载 ScaNN 动态库。可用 `MEMORYH_SPLITTER_ADDR` 指定其他本机地址，用 `MEMORYH_SCANN_LIB` 指定动态库文件。每个实例也可用 `with_splitter` 和 `with_scann` 修改地址和路径。库加载失败时打开存储报错，拆题请求失败时查询返回错误。准备好上述模型后，可用以下命令在独立终端启动服务。
 
@@ -29,12 +29,12 @@ target/scann-eval/deps/llama/llama-server \
 
 ## 本地 Qwen 检索
 
-调用方把记忆原文传给 `QwenStore::apply`，把问题文本传给 `retrieve`，拿回最多三条带 ID、来源和版本的原文。拆题由本机 llama.cpp 服务执行，编码和重排在 Rust 进程中通过 ONNX Runtime CPU 执行。
+调用方把记忆原文传给 `QwenStore::apply`，把问题文本传给 `retrieve`，普通问题默认拿回三条带 ID、来源和版本的原文，清点问题默认拿回五条。`retrieve_top_k` 可显式指定条数。拆题由本机 llama.cpp 服务执行，编码和重排在 Rust 进程中通过 ONNX Runtime CPU 执行。
 
 1. 写入时，Qwen3-Embedding-0.6B 用模型自带的 tokenizer 直接编码原文。引擎取最后一个有效 token 的隐藏状态，L2 归一化成 1,024 维向量，随原文一起提交。BM25 另外用 Rust 的 Jieba 词典分词，并保留连续的字母数字编号。
 2. 查询时，Qwen3.5-2B 先判断是否需要拆题。编码器随后处理整题和实际生成的子问题。文档和问题都使用原始文本，无额外指令前缀。本地编码入口最多接收 2,048 个 token，较长输入会截断，存储的原文保持完整。
-3. 在同一批当前有效版本上，整题及各子句分别做 BM25 和向量近邻搜索，每路各取最多 9 条。合并候选时按不可复用的记录 ID 去重。
-4. Yuanbao-Reranker-0.6B 在本地用记忆检索提示词逐条判断候选，输入包含整题和候选原文。取最后一个有效 token 的 `yes` 与 `no` 的 logit 差作为分数。这个顺序与官方双标签 softmax 概率相同。含模板的输入上限为 512 token，截断时保留判断后缀。按分数降序取 Top 3，同分按 ID 排序。[Qwen 模型卡](https://huggingface.co/Qwen/Qwen3-Embedding-0.6B) · [Yuanbao 重排模型卡](https://huggingface.co/Yuanbao-Search/Yuanbao-Reranker-0.6B)
+3. 在同一批当前有效版本上，整题及各子句分别做 BM25 和向量近邻搜索，每路默认各取最多 32 条。合并候选时按不可复用的记录 ID 去重。
+4. Yuanbao-Reranker-0.6B 在本地用记忆检索提示词逐条判断候选，输入包含整题和候选原文。取最后一个有效 token 的 `yes` 与 `no` 的 logit 差作为分数。这个顺序与官方双标签 softmax 概率相同。含模板的输入上限为 512 token，截断时保留判断后缀。保留整题逐条打分，再用各个子问题分别重排候选，优先保留各角度的首条证据。个性化建议额外从已有设备、习惯和偏好补召回并独立重排。清点题逐段抽取物品或事件并校验原文引句。Qwen 先检查每个条目的类别和状态，再比较它与已有条目是否指向同一实例。对于单日活动，原文中可核实的日期或相对日用于区分不同场次。选取前五条时，每一步优先选能补充最多新事实的原文，新增数相同时沿用重排名次。[Qwen 模型卡](https://huggingface.co/Qwen/Qwen3-Embedding-0.6B) · [Yuanbao 重排模型卡](https://huggingface.co/Yuanbao-Search/Yuanbao-Reranker-0.6B)
 
 ```rust
 use memoryh::{Memory, Mutation, Options};
@@ -53,6 +53,23 @@ fn search(runtime: &std::path::Path) -> memoryh::Result<()> {
     }
     Ok(())
 }
+```
+
+时间题可以调用 `retrieve_with_context(question, &context)`。给 `QueryContext.question_date` 传提问日期。候选的会话日期优先从 `context.session_dates` 按不可变记录 ID 获取，其次读取 `Memory.source` 开头的 ISO 或 LongMemEval 日期。重排输入携带双方日期及相差天数，返回原文保持原样。未提供的日期不做推测。
+
+```rust
+use memoryh::qwen::{QueryContext, session_date};
+
+let mut context = QueryContext { question_date: session_date("2025-06-20"), ..Default::default() };
+context.session_dates.insert("session-1".into(), session_date("2025-06-10").unwrap());
+let hits = store.retrieve_with_context("十天前我去了哪个公园？", &context)?;
+```
+
+复测入口支持 `--vector-limit`、`--keyword-limit`、`--exact-threshold`、`--probes`。`--rounds 0` 仅测质量，报告分别给出候选池、Top 3、Top 5 的完整证据命中。运行以下命令可单独验证日期、比较、建议和清点的中文开发用例。
+
+```sh
+python3 scripts/benchmark-scann.py --rounds 0 --fixture tests/fixtures/evidence-zh.json
+python3 scripts/benchmark-scann.py --rounds 0 --fixture tests/fixtures/events-zh.json
 ```
 
 在 Apple Silicon 上，准备脚本校验固定权重，首次通过 `uv` 将 Yuanbao 的 BF16 权重导出为 FP16 ONNX 并对照 Transformers 校验。查询可离线执行。已有 Qwen 向量库可直接更换 reranker。[Yuanbao 提示词与 21 题复测](yuanbao-results.md) · [先前 MiniLM 基线](qwen-results.md)

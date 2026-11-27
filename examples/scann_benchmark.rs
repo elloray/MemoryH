@@ -1,6 +1,8 @@
 mod common;
 use common::{Fixture, InputRecord};
-use memoryh::qwen::{QwenModels, QwenStore, SearchProfile};
+use memoryh::qwen::{
+    QueryContext, QwenModels, QwenStore, RecallOptions, SearchProfile, session_date,
+};
 use memoryh::{Mutation, Options};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -15,6 +17,7 @@ struct Question {
     id: String,
     text: String,
     stage: String,
+    question_date: Option<String>,
 }
 
 fn sample(start: Instant, p: &SearchProfile) -> Value {
@@ -32,10 +35,37 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("usage: scann_benchmark ENCODER YUANBAO ORT ROUNDS".into());
     };
     let rounds: usize = rounds.parse()?;
-    let models = QwenModels::load(encoder, reranker, runtime, 2)?;
+    let mut options = RecallOptions::default();
+    if let Some(v) = env::var_os("MEMORYH_EVAL_VECTOR_LIMIT") {
+        options.vector_limit = v.to_string_lossy().parse()?;
+    }
+    if let Some(v) = env::var_os("MEMORYH_EVAL_KEYWORD_LIMIT") {
+        options.keyword_limit = v.to_string_lossy().parse()?;
+    }
+    if let Some(v) = env::var_os("MEMORYH_EVAL_EXACT_THRESHOLD") {
+        options.exact_threshold = v.to_string_lossy().parse()?;
+    }
+    if let Some(v) = env::var_os("MEMORYH_EVAL_PROBES") {
+        options.partitions_to_search = Some(v.to_string_lossy().parse()?);
+    }
+    let models = QwenModels::load(encoder, reranker, runtime, 2)?.with_recall_options(options);
     let dir = tempfile::tempdir()?;
     let store = QwenStore::open(dir.path(), Options::default(), models.clone())?;
-    let fixture: Fixture<Question> = serde_json::from_str(include_str!("../cases.json"))?;
+    let data = match env::var_os("MEMORYH_EVAL_FIXTURE") {
+        Some(path) => std::fs::read_to_string(path)?,
+        None => include_str!("../cases.json").to_owned(),
+    };
+    let fixture: Fixture<Question> = serde_json::from_str(&data)?;
+    let mut context = QueryContext::default();
+    let set_date =
+        |context: &mut QueryContext, q: &Question| -> Result<(), Box<dyn std::error::Error>> {
+            context.question_date = q
+                .question_date
+                .as_deref()
+                .map(|d| session_date(d).ok_or("invalid question date"))
+                .transpose()?;
+            Ok(())
+        };
     let mut live = HashMap::<String, InputRecord>::new();
     let mut cases = BTreeMap::new();
     let mut reopen_checks = Vec::new();
@@ -58,7 +88,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .filter(|q| q.stage == stage)
             .collect();
         for q in &questions {
-            let p = store.retrieve_profiled(&q.text, usize::MAX)?;
+            set_date(&mut context, q)?;
+            let p = store.retrieve_profiled_with_context(&q.text, Some(usize::MAX), &context)?;
             let pool: Vec<_> = p.records.iter().map(|r| &r.memory.id).collect();
             let unique: std::collections::HashSet<_> = pool.iter().collect();
             assert_eq!(pool.len(), unique.len(), "{} repeated ID", q.id);
@@ -70,16 +101,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let top = pool.iter().take(3).copied().collect::<Vec<_>>();
             cases.insert(
                 q.id.clone(),
-                json!({"variants":p.variants, "pool":pool,"top":top,"samples":[]}),
+                json!({"intent":format!("{:?}",p.intent), "facts":p.inventory_facts, "variants":p.variants, "pool":pool, "top5":pool.iter().take(5).collect::<Vec<_>>(),"top":top,"samples":[]}),
             );
             if stage == "after" {
-                reopen_checks.push((&q.text, p.records.into_iter().take(3).collect::<Vec<_>>()));
+                reopen_checks.push((*q, p.records.into_iter().take(5).collect::<Vec<_>>()));
             }
         }
         for round in 0..rounds {
             for q in &questions {
+                set_date(&mut context, q)?;
                 let start = Instant::now();
-                let p = store.retrieve_profiled(&q.text, 3)?;
+                let p = store.retrieve_profiled_with_context(&q.text, Some(5), &context)?;
                 let duration = sample(start, &p);
                 let case = cases.get_mut(&q.id).unwrap();
                 assert_eq!(
@@ -90,7 +122,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 );
                 assert_eq!(
                     json!(p.records.iter().map(|r| &r.memory.id).collect::<Vec<_>>()),
-                    case["top"],
+                    case["top5"],
                     "{} ranking changed",
                     q.id
                 );
@@ -102,11 +134,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     drop(store);
     let store = QwenStore::open(dir.path(), Options::default(), models)?;
     for (q, top) in &reopen_checks {
-        assert_eq!(store.retrieve(q)?, *top, "reopen changed {q}");
+        set_date(&mut context, q)?;
+        assert_eq!(
+            store
+                .retrieve_profiled_with_context(&q.text, Some(5), &context)?
+                .records,
+            *top,
+            "reopen changed {}",
+            q.id
+        );
     }
     println!(
         "{}",
-        json!({"cases":cases,"reopened":reopen_checks.len(),"rounds":rounds})
+        json!({"cases":cases,"reopened":reopen_checks.len(),"rounds":rounds,
+            "recall":{"vector_limit":options.vector_limit,"keyword_limit":options.keyword_limit,
+            "exact_threshold":options.exact_threshold,"partitions_to_search":options.partitions_to_search}})
     );
     Ok(())
 }
