@@ -21,7 +21,8 @@ def snapshot(out, locked):
     # Read downstream first so a concurrent checkpoint cannot outrun its inputs.
     judged, answers, rank = (stage(s) for s in ("judgments", "answers", "retrieval"))
     total = 500
-    status = read(out / "retrieval-status.json")
+    status_path = out / "retrieval-status.json"
+    status = read(status_path) if status_path.is_file() else {}
     retrieving = len(rank) < total and locked(out / "retrieval.lock")
     grading = len(judged) < total and locked(out / "qa.lock")
     active = status.get("question") if retrieving else None
@@ -54,6 +55,9 @@ def snapshot(out, locked):
         "answered": len(answers),
         "judged": len(judged),
         "correct": items.count("yes"),
+        "graded_search_errors": sum(
+            bool(j.get("search_error")) for j in judged.values()
+        ),
         "active": status if retrieving else None,
         "retrieving": retrieving,
         "grading": grading,

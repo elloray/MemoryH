@@ -24,6 +24,7 @@ def main():
         raise ValueError("Missing or unexpected checkpoint files")
     counts, right = Counter(), Counter()
     recall_hits, recall_n, abs_hits, abs_n = 0, 0, 0, 0
+    failed_searches = 0
     latencies, ingestion, tokens = [], [], []
     for unit in units:
         i = unit["index"]
@@ -45,6 +46,15 @@ def main():
         ) or jud["label"] not in ("CORRECT", "WRONG"):
             raise ValueError(f"Invalid answer/judge {i}")
         good = jud["label"] == "CORRECT"
+        if ret.get("search_error"):
+            if (
+                good
+                or ret["results"]
+                or ans["final_answer"] != "[SEARCH_FAILED]"
+                or any(x.get("search_error") != ret["search_error"] for x in (ans, jud))
+            ):
+                raise ValueError(f"Invalid failed-search checkpoints {i}")
+            failed_searches += 1
         counts[qa["category"]] += 1
         right[qa["category"]] += good
         if label.endswith("_abs"):
@@ -90,6 +100,7 @@ def main():
     report += [
         "",
         f"其中拒答题 {abs_hits}/{abs_n}。可作答且标有证据的题目中，Top 20 原始发言覆盖全部标注会话的题数为 {recall_hits}/{recall_n}。此项按会话 ID 核对。",
+        f"检索模型在固定预算内未完成输出的有 {failed_searches} 题，依 EverOS 规则计入 500 题并判错。",
         "",
         "## 测评配置",
         "",

@@ -108,6 +108,7 @@ function draw(d) {
   el("updated").textContent = "更新于 " + new Date(d.time).toLocaleTimeString("zh-CN",{timeZone:"Asia/Shanghai",hour12:false});
   el("done").textContent = d.judged + " / " + d.total;
   el("grade").textContent = d.judged ? "已判 " + d.judged + " 题，答对 " + d.correct + "，答错 " + (d.judged-d.correct) : "等待首条判分";
+  if (d.graded_search_errors) el("grade").textContent += "（含 " + d.graded_search_errors + " 题检索失败）";
   const c = comparison(d.correct, d.judged, d.total);
   el("live-rate").textContent = c.rate === null ? "—" : c.rate.toFixed(1) + "%";
   el("live-bar").style.width = c.rate === null ? "0%" : c.rate + "%";
