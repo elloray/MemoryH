@@ -9,6 +9,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 import locomo_progress
+import longmemeval_everos_progress
 from locomo_mps_report import report as gpu_report
 
 PAGE = Path(__file__).with_name("longmemeval-progress.html")
@@ -132,7 +133,19 @@ def main():
             path = urlsplit(self.path).path
             v2 = args.out.resolve().parent / "lme-v2"
             locomo = v2.parent / "locomo-compare"
-            if path in ("/", "/locomo") and (locomo / "reference.json").is_file():
+            everos = v2.parent / "lme-s-everos-20261128"
+            if path == "/everos" and (everos / "retrieval-status.json").is_file():
+                body = PAGE.with_name("longmemeval-everos-progress.html").read_bytes()
+                typ = "text/html; charset=utf-8"
+            elif (
+                path == "/everos-status.json"
+                and (everos / "retrieval-status.json").is_file()
+            ):
+                body = json.dumps(
+                    longmemeval_everos_progress.snapshot(everos, locked)
+                ).encode()
+                typ = "application/json; charset=utf-8"
+            elif path in ("/", "/locomo") and (locomo / "reference.json").is_file():
                 body = PAGE.with_name("locomo-progress.html").read_bytes()
                 typ = "text/html; charset=utf-8"
             elif path == "/locomo-status.json":
