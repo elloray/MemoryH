@@ -136,15 +136,25 @@ def search_and_checkpoint(unit, prepared, resources, progress):
         qa = unit["qa"][0]
         progress.update(number, "search", turns=len(turns))
         search_start = time.time()
-        reply = request(
-            proc,
-            {
-                "op": "search",
-                "question": qa["question"],
-                "date": qa["question_date"],
-                "top_k": 20,
-            },
-        )
+        try:
+            reply = request(
+                proc,
+                {
+                    "op": "search",
+                    "question": qa["question"],
+                    "date": qa["question_date"],
+                    "top_k": 20,
+                },
+            )
+        except RuntimeError as exc:
+            if (
+                str(exc)
+                != "invalid search query: Qwen3.5-2B splitter: incomplete response"
+            ):
+                raise
+            # This history produced no evidence within the frozen model budget.
+            # Record the model failure for the reference harness's search-error rule.
+            reply = {"results": [], "search_error": str(exc)}
         search_finish = time.time()
         hits = reply["results"]
         ids = {t["id"]: t for t in turns}
@@ -174,7 +184,8 @@ def search_and_checkpoint(unit, prepared, resources, progress):
             },
         )
         progress.update(number)
-        print(f"{number}/500 retrieved", flush=True)
+        outcome = reply.get("search_error") or f"{len(hits)} hits"
+        print(f"{number}/500 retrieval finished: {outcome}", flush=True)
 
 
 def run_pipeline(units, addr, binary):

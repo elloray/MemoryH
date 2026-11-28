@@ -106,6 +106,9 @@ def grade(key, unit, row):
     qid = qa["question_id"]
     if row["index"] != index or row["question_id"] != qid:
         raise ValueError("retrieval checkpoint does not match dataset")
+    search_error = row.get("search_error")
+    if search_error and row["results"]:
+        raise ValueError("failed search contains evidence")
     answer_path = OUT / "answers" / f"{index:03}.json"
     source_hash = hashlib.sha256(
         json.dumps(row["results"], sort_keys=True).encode()
@@ -118,6 +121,8 @@ def grade(key, unit, row):
             qid,
         ):
             raise ValueError("incompatible answer checkpoint")
+        if answer.get("search_error") != search_error:
+            raise ValueError("incompatible search error in answer checkpoint")
     else:
         hits = row["results"]
         usage, fingerprint, prompt_hash = {}, None, None
@@ -147,7 +152,9 @@ def grade(key, unit, row):
             if not answer_text or not answer_text.strip():
                 raise ValueError("empty reader answer")
         else:
-            answer_text = adapter.EMPTY_RETRIEVAL_MARKER
+            answer_text = (
+                "[SEARCH_FAILED]" if search_error else adapter.EMPTY_RETRIEVAL_MARKER
+            )
         answer = {
             "index": index,
             "question_id": qid,
@@ -158,8 +165,10 @@ def grade(key, unit, row):
             "usage": usage,
             "fingerprint": fingerprint,
         }
+        if search_error:
+            answer["search_error"] = search_error
         put(answer_path, answer)
-    if answer["final_answer"] == adapter.EMPTY_RETRIEVAL_MARKER:
+    if search_error or answer["final_answer"] == adapter.EMPTY_RETRIEVAL_MARKER:
         verdict, usage, fingerprint = "WRONG", {}, None
     else:
         prompt = adapter.JUDGE_USER_PROMPT.format(
@@ -194,6 +203,7 @@ def grade(key, unit, row):
         "usage": usage,
         "fingerprint": fingerprint,
         "answer_prompt_sha256": answer["prompt_sha256"],
+        **({"search_error": search_error} if search_error else {}),
     }
 
 
