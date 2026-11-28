@@ -256,6 +256,25 @@ python3 scripts/longmemeval-progress.py --out target/lme-qwen-main --port 8765
 
 本机进度页位于 `http://127.0.0.1:8765/`。CPU 对照可显式指定 `--reranker cpu`。检查点位于 `target/locomo-compare/`，续跑会复用已完成的题目。
 
+### LongMemEval-S 与 EverOS 对照
+
+本轮使用 EverOS 固定版本指定的原版 500 题，每题独立建库，保留双方发言及会话日期。MemoryH 取 128 条向量候选和 32 条关键词候选，在不超过 19,999 条向量时精确检索，Yuanbao 重排后返回最多 20 条发言。Apple Silicon 上一题建库可与上一题重排并行，云端同时作答或判分。
+
+作答模型为 GPT-5.6 Terra（`xhigh`，API 默认温度 1），裁判为 GPT-4o-mini（温度 0，单次判分）。EverOS 的 94.0% 使用 Gemini 3.6 Flash（温度 0）读取最多 20 个 episode。照用上游提示词时，说话人别名中包含题号，30 道不可作答题的题号含 `_abs`。检索阶段只接收日期、发言和问题。[EverOS 配置](https://github.com/EverMind-AI/EverOS/blob/d2b74780a443c6d7304ca9aa1bfdf36fdc6d7c9b/benchmarks/configs/longmemeval.toml)
+
+通过本机文件 `~/.config/memoryh/longmemeval-api-key` 提供可调用两个模型的 OpenAI API 密钥。准备好 Metal 重排模型后，分别启动评测和进度页。
+
+```sh
+uv run scripts/prepare-yuanbao-mps.py target/yuanbao-mps
+python3 scripts/longmemeval-everos-supervise.py
+```
+
+```sh
+python3 scripts/longmemeval-progress.py --out target/lme-s-everos-20261128 --port 8766
+```
+
+[本机实时进度](http://127.0.0.1:8766/everos) 显示正在处理的题目、已判样本量和官宣参照。检查点保存在 `target/lme-s-everos-20261128/`，续跑会复用已完成的题目。收齐 500 道判分后生成 `report.md`，答对至少 471 题即超过 94.0%。
+
 ## 实验方法
 
 - **FTS5** 将中文切成重叠双字，将字母数字串保留为整体。查询用同样的方式生成词项，由 SQLite BM25 排序。同一个查询文本的 FTS5 候选由扁平与树路线共用。[SQLite FTS5](https://sqlite.org/fts5.html)

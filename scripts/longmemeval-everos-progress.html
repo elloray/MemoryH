@@ -1,0 +1,164 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>MemoryH · LongMemEval-S 实时进度</title>
+  <link rel="stylesheet" href="/progress.css">
+  <style>
+    .benchmark { border-top: 1px solid var(--ink); padding-top: 20px; }
+    .compare-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 32px; }
+    .compare-grid h3 { font-size: 16px; margin: 6px 0; }
+    .compare-grid output { font-size: clamp(24px, 4vw, 36px); font-weight: 600; }
+    .compare-grid p { margin: 5px 0; }
+    .benchmark .track { height: 7px; margin-top: 8px; }
+    .benchmark .reference-bar { background: #70858b; width: 94%; }
+    .benchmark .delta { color: var(--ink); font-weight: 600; margin: 15px 0 4px; }
+    .benchmark .goal { margin: 4px 0; }
+    @media(max-width: 600px) { .compare-grid { gap: 16px; } }
+  </style>
+</head>
+<body>
+<header><div><b class="brand">MemoryH</b><span id="live" class="status" role="status">读取检查点…</span></div></header>
+<main>
+  <div class="lead">
+    <div><h1>LongMemEval-S</h1><p>原版 500 题 · Top 20 发言 · GPT-5.6 Terra 作答 · GPT-4o-mini 判分</p></div>
+    <div class="score"><p>已完成判分</p><div class="num" id="done">—</div><p id="grade">等待检查点</p></div>
+  </div>
+  <div class="stages" id="stages"></div>
+  <p id="active" aria-live="polite"></p>
+  <section class="benchmark" aria-labelledby="comparison-title">
+    <h2 id="comparison-title">MemoryH 与 EverOS 实时对比</h2>
+    <div class="compare-grid">
+      <div>
+        <h3>MemoryH · 本轮实测</h3>
+        <output id="live-rate">—</output>
+        <div class="track" aria-hidden="true"><i id="live-bar"></i></div>
+        <p id="live-base">等待首题判分</p>
+      </div>
+      <div>
+        <h3><a href="https://github.com/EverMind-AI/EverOS/blob/d2b74780a443c6d7304ca9aa1bfdf36fdc6d7c9b/benchmarks/README.md">EverOS · 官宣基线</a></h3>
+        <output>94.0%</output>
+        <div class="track" aria-hidden="true"><i class="reference-bar"></i></div>
+        <p>全量 500 题 · Gemini 3.6 Flash</p>
+      </div>
+    </div>
+    <p class="delta" id="live-delta"></p>
+    <p class="goal" id="goal"></p>
+    <small id="comparison-note">已判样本按数据集顺序增加。EverOS 此处仅有全量参照，逐题胜负未核实。</small>
+  </section>
+  <section>
+    <div class="row"><h2>逐题进度</h2><small id="updated"></small></div>
+    <div class="legend"><span><i></i>待检索</span><span><i class="work"></i>进行中</span><span><i class="rank"></i>已检索</span><span><i class="answer"></i>已作答</span><span><i class="yes"></i>答对</span><span><i class="no"></i>答错</span></div>
+    <div class="cells" id="cells" role="img" aria-label="按题号显示 500 题状态"></div>
+    <p id="last"></p>
+  </section>
+  <section class="cols">
+    <div>
+      <h2>全量结果</h2>
+      <table><thead><tr><th>系统</th><th>作答模型</th><th>全量准确率</th></tr></thead>
+      <tbody>
+        <tr><td>MemoryH</td><td>GPT-5.6 Terra</td><td id="final">待 500 题判完</td></tr>
+        <tr><td><a href="https://github.com/EverMind-AI/EverOS/blob/d2b74780a443c6d7304ca9aa1bfdf36fdc6d7c9b/benchmarks/README.md">EverOS 官宣</a></td><td>Gemini 3.6 Flash</td><td>94.0%</td></tr>
+        <tr><td>阿里云 OpenSearch</td><td>本轮未测</td><td>—</td></tr>
+      </tbody></table>
+      <p>答对 470/500 题持平，471/500 题超过官宣分数。两边作答模型不同。</p>
+    </div>
+    <div>
+      <h2>每题耗时</h2>
+      <table><thead><tr><th>阶段</th><th>已完成题目的中位数</th></tr></thead><tbody>
+        <tr><td>本机建库</td><td id="index-time">—</td></tr>
+        <tr><td>检索与重排</td><td id="search-time">—</td></tr>
+      </tbody></table>
+    </div>
+  </section>
+  <footer>每 3 秒刷新 · 北京时间 · 本机评测检查点</footer>
+</main>
+<script>
+const el = id => document.getElementById(id);
+const stages = [["retrieved","检索"],["answered","作答"],["judged","判分"]];
+const labels = {"":"待检索",work:"进行中",rank:"已检索",answer:"已作答",yes:"答对",no:"答错"};
+for (const [field,title] of stages) {
+  const node = document.createElement("div");
+  node.innerHTML = '<div class="barlabel"><h2>' + title + '</h2><output id="n-' + field + '">—</output></div><div class="track"><i id="b-' + field + '"></i></div>';
+  el("stages").append(node);
+}
+const cells = [];
+const mins = v => v == null ? "—" : Math.floor(v/60) + " 分 " + String(Math.floor(v%60)).padStart(2,"0") + " 秒";
+const pct = (n, t) => (100*n/t).toFixed(1) + "%";
+function comparison(correct, judged, total) {
+  const baseline = 94;
+  const target = Math.floor(baseline * total / 100) + 1;
+  const remaining = total - judged;
+  const needed = Math.max(0, target - correct);
+  const rate = judged ? 100 * correct / judged : null;
+  const diff = rate === null ? null : Number((rate - baseline).toFixed(1));
+  let targetText;
+  if (needed === 0) {
+    targetText = "已答对至少 " + target + " 题，超过 94.0% 的题数门槛。";
+  } else if (remaining < needed) {
+    targetText = "本轮最多可答对 " + (correct + remaining) + "/" + total + " 题，已无法超过 94.0%。";
+  } else {
+    targetText = "要超过 94.0%，剩余 " + remaining + " 题中至少要答对 " + needed + " 题，还可答错 " + (remaining - needed) + " 题。";
+  }
+  return {rate, diff, targetText};
+}
+function draw(d) {
+  el("live").textContent = d.complete ? "评测完成" : !d.retrieving && d.retrieved<d.total ? "检索已停止" : !d.grading ? "判分已停止" : "运行中";
+  el("updated").textContent = "更新于 " + new Date(d.time).toLocaleTimeString("zh-CN",{timeZone:"Asia/Shanghai",hour12:false});
+  el("done").textContent = d.judged + " / " + d.total;
+  el("grade").textContent = d.judged ? "已判 " + d.judged + " 题，答对 " + d.correct + "，答错 " + (d.judged-d.correct) : "等待首条判分";
+  const c = comparison(d.correct, d.judged, d.total);
+  el("live-rate").textContent = c.rate === null ? "—" : c.rate.toFixed(1) + "%";
+  el("live-bar").style.width = c.rate === null ? "0%" : c.rate + "%";
+  el("live-base").textContent = "已判 " + d.judged + " 题，答对 " + d.correct + " 题 · GPT-5.6 Terra";
+  const signed = c.diff === null ? "" : (c.diff > 0 ? "+" : "") + c.diff.toFixed(1);
+  el("live-delta").textContent = c.diff === null ? "首题判分后显示分差" :
+    (d.complete ? "全量分差 " : "已判样本与官宣全量的分差 ") + signed + " 个百分点";
+  el("goal").textContent = c.targetText;
+  if (d.complete) {
+    el("comparison-note").textContent = "两侧都覆盖 500 题，作答模型不同。EverOS 采用官宣总分。";
+  }
+  for(const [field] of stages) {
+    el("n-"+field).textContent = d[field] + " / " + d.total;
+    el("b-"+field).style.width = pct(d[field],d.total);
+  }
+  const workers = d.active?.workers ?? (d.active?.question ? [d.active] : []);
+  const activeNumbers = new Set(workers.map(w => w.question));
+  d.items.forEach((checkpoint,i) => {
+    const state = checkpoint || (activeNumbers.has(i + 1) ? "work" : "");
+    if(!cells[i]) {
+      cells[i]=document.createElement("span");
+      el("cells").append(cells[i]);
+    }
+    cells[i].className=state;
+    cells[i].title="第 "+(i+1)+" 题 · "+labels[state];
+  });
+  const activity = workers.map(a => {
+    if (a.phase === "index") return "第 "+a.question+" 题正在建库，已写入 "+a.written+" / "+a.turns+" 条发言（"+pct(a.written,a.turns)+"）";
+    if (a.phase === "ready") return "第 "+a.question+" 题已完成建库，等待重排";
+    const elapsed = Math.max(0, Date.parse(d.time)/1000 - a.updated);
+    return "第 "+a.question+" 题已写完 "+a.turns+" 条发言，检索与重排已用 "+mins(elapsed);
+  });
+  if (d.grading && d.answered > d.judged) activity.push("第 "+(d.judged+1)+" 题待判分或正在判分");
+  else if (d.grading && d.retrieved > d.answered) activity.push("第 "+(d.answered+1)+" 题待作答或正在作答");
+  el("active").textContent = activity.join(" · ");
+  el("last").textContent = d.last ? "最近判分　第 "+d.last.number+" 题 · "+(d.last.label==="CORRECT"?"答对":"答错")+" · 作答输入 "+d.last.input_tokens.toLocaleString()+" token" : "";
+  el("index-time").textContent=mins(d.median_index_s);
+  el("search-time").textContent=mins(d.median_search_s);
+  el("final").textContent=d.complete ? pct(d.correct,d.total) : "待 500 题判完";
+}
+async function update() {
+  try {
+    const res=await fetch("/everos-status.json",{cache:"no-store"});
+    if(!res.ok) throw Error("status "+res.status);
+    draw(await res.json());
+  } catch {
+    el("live").textContent="连接中断，正在重试";
+  } finally {
+    setTimeout(update,3000);
+  }
+}
+update();
+</script>
+</body></html>
